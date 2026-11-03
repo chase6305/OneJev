@@ -128,6 +128,19 @@ EOF
 
 接口兼容 TypeSafe System One。更多示例：[视频](../examples/video.py)、[curl](../examples/curl.sh)、[官方 TypeSafe SDK](../examples/official_sdk.py)。
 
+### 搭配 Playwright 做网页操作验证
+
+[浏览器验证示例](../examples/browser_verify.md#中文使用说明)将网页操作、截图、OneJev 判断和有限次数重试连接起来，
+提供本地发票演示、失败场景、已有网页检查，以及每一步的截图和 JSON 报告。
+
+```bash
+pip install -e '.[browser]'
+python -m playwright install chromium
+python examples/browser_verify.py
+```
+
+保持模型服务单独运行。系统已安装 Google Chrome 时可加 `--channel chrome`，通过 `--base-url` 指定其他模型服务地址。
+
 ## 训练
 
 ```bash

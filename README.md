@@ -136,6 +136,21 @@ EOF
 The API is compatible with TypeSafe System One. More examples: [video](examples/video.py),
 [curl](examples/curl.sh), [official TypeSafe SDK](examples/official_sdk.py).
 
+### Browser automation with Playwright
+
+The [browser verification example](examples/browser_verify.md) connects page actions,
+screenshots, OneJev judgments and bounded retries. It includes a local invoice demo,
+failure scenarios, a mode for checking an existing page, and per-step screenshots and JSON reports.
+
+```bash
+pip install -e '.[browser]'
+python -m playwright install chromium
+python examples/browser_verify.py
+```
+
+Keep a model server running separately. Use `--channel chrome` with an installed Google Chrome,
+or `--base-url` to select a different model endpoint.
+
 ## Training
 
 ```bash
