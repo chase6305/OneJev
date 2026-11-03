@@ -1,5 +1,6 @@
 """Model service ownership and persistent Studio artifacts, without a GPU."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.error import URLError
 
-from qev.studio import Backend, Config, Session
+from qev.studio import Backend, Config, Session, Studio
 
 
 class BackendTests(unittest.IsolatedAsyncioTestCase):
@@ -69,6 +70,23 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(loaded["history"][0]["decision"]["action"], "pay")
             self.assertFalse(loaded["busy"])
             self.assertFalse((session.path / "report.tmp").exists())
+
+
+@unittest.skipUnless(os.environ.get("QEV_BROWSER_TESTS") == "1", "set QEV_BROWSER_TESTS=1 to check browser recovery")
+class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_closed_browser_is_recreated_for_the_next_case(self):
+        with tempfile.TemporaryDirectory() as root:
+            studio = Studio(Config(output=Path(root), channel=os.environ.get("QEV_BROWSER_CHANNEL")))
+            try:
+                first = await studio.create_session("retry")
+                original = studio.browser
+                await original.close()
+                second = await studio.create_session("success")
+                self.assertIsNot(studio.browser, original)
+                self.assertNotEqual(first.id, second.id)
+                self.assertTrue((second.path / "preview.png").is_file())
+            finally:
+                await studio.close()
 
 
 if __name__ == "__main__":

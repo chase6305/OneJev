@@ -137,9 +137,13 @@ class Session:
         self.attempts = 0
         self.result: str | None = None
         self.error: str | None = None
+        self.retryable = False
+        self.pending_action: str | None = None
+        self.observations = 0
         self.frame = "preview.png"
         self.auto_running = False
         self.delay = 3.0
+        self.next_step_at: float | None = None
         self.auto_task: asyncio.Task | None = None
         self.pause_event = asyncio.Event()
         self.lock = asyncio.Lock()
@@ -149,6 +153,7 @@ class Session:
             "id": self.id, "scenario": self.scenario, "created_at": self.created_at,
             "attempts": self.attempts, "result": self.result, "error": self.error,
             "busy": self.lock.locked(), "auto_running": self.auto_running, "delay": self.delay,
+            "retryable": self.retryable, "next_step_at": self.next_step_at,
             "frame": f"/api/runs/{self.id}/images/{self.frame}", "history": self.history,
         }
 
@@ -171,16 +176,24 @@ class Studio:
 
     async def get_browser(self):
         async with self.browser_lock:
+            if self.browser is not None and not self.browser.is_connected():
+                self.browser = None
             if self.browser is None:
                 try:
                     from playwright.async_api import async_playwright
                 except ImportError as exc:
                     raise HTTPException(503, "请先安装浏览器支持：pip install -e '.[browser]'") from exc
-                self.playwright = await async_playwright().start()
+                if self.playwright is None:
+                    self.playwright = await async_playwright().start()
                 channel = self.config.channel
                 if channel is None and (shutil.which("google-chrome") or shutil.which("google-chrome-stable")):
                     channel = "chrome"
-                self.browser = await self.playwright.chromium.launch(headless=True, channel=channel)
+                try:
+                    self.browser = await self.playwright.chromium.launch(headless=True, channel=channel)
+                except Exception:
+                    await self.playwright.stop()
+                    self.playwright = None
+                    raise
             return self.browser
 
     async def create_session(self, scenario: str) -> Session:
@@ -220,12 +233,15 @@ class Studio:
             raise HTTPException(503, "模型尚未就绪，请等待右上角状态变为就绪")
         async with session.lock:
             observation = None
+            session.error, session.retryable = None, False
             try:
-                if session.history:
-                    action = session.history[-1]["decision"]["action"]
+                if session.pending_action is not None:
+                    action = session.pending_action
+                    # Consume before awaiting: retrying inference must never repeat an action.
+                    session.pending_action = None
                     if action in ("pay", "retry"):
-                        await session.page.locator("#pay").click()
                         session.attempts += 1
+                        await session.page.locator("#pay").click()
                     if action in ("pay", "retry", "wait"):
                         from playwright.async_api import TimeoutError as BrowserTimeout
 
@@ -239,6 +255,11 @@ class Studio:
                 png = await session.page.screenshot(path=str(session.path / name), animations="disabled", caret="hide")
                 captured = await session.page.locator("body").get_attribute("data-state")
                 session.frame = name
+                observation = {
+                    "step": step, "attempts": session.attempts, "screenshot": name,
+                    "image": f"/api/runs/{session.id}/images/{name}", "page_status": captured,
+                    "answers": {},
+                }
                 started = time.perf_counter()
                 response = await asyncio.to_thread(
                     self.backend.client.system_one,
@@ -249,33 +270,42 @@ class Studio:
                     media=[{"type": "image", "data": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}],
                 )
                 current = await session.page.locator("body").get_attribute("data-state")
-                observation = {
-                    "step": step, "attempts": session.attempts, "screenshot": name,
-                    "image": f"/api/runs/{session.id}/images/{name}", "page_status": current,
+                observation.update({
+                    "page_status": current,
                     "model": response.model, "answers": {k: v.raw for k, v in response.answers.items()},
                     "usage": response.usage, "meta": response.meta, "request_id": response.request_id,
                     "request_s": time.perf_counter() - started,
-                }
+                })
                 prediction = Prediction.from_answers(observation["answers"])
+                session.observations += 1
                 decision = (decide(prediction, current, session.attempts, 2, 0.85, 0.6) if current == captured
                             else Decision("wait", "The page changed during inference; take a fresh screenshot."))
-                if decision.action in ("pay", "retry", "wait") and step >= 5:
+                if decision.action in ("pay", "retry", "wait") and session.observations >= 6:
                     decision = Decision("exhausted", "The observation limit has been reached.")
                 observation["decision"] = asdict(decision)
                 session.history.append(observation)
-                if decision.action not in ("pay", "retry", "wait"):
+                if decision.action in ("pay", "retry", "wait"):
+                    session.pending_action = decision.action
+                else:
                     session.result = decision.action
                     session.auto_running = False
             except Exception as exc:
                 log.exception("Session step failed")
-                session.error = "模型服务未连接，请重新连接后新建案例" if isinstance(exc, URLError) else str(exc)
-                session.result, session.auto_running = "error", False
+                session.retryable = (isinstance(exc, (URLError, OSError, TimeoutError))
+                                     and (not isinstance(exc, HTTPError) or exc.code >= 500 or exc.code == 429))
+                session.error = ("模型请求暂时失败。连接恢复后点击“重新判断”，会保留当前页面，不重复执行上一步。"
+                                 if session.retryable else str(exc))
+                session.result = None if session.retryable else "error"
+                session.auto_running = False
+                session.next_step_at = None
                 if observation is not None:
-                    observation["decision"] = {"action": "error", "reason": session.error}
+                    observation["decision"] = {"action": "reconnect" if session.retryable else "error", "reason": session.error}
                     # Non-finite model values must not corrupt the saved JSON report.
                     observation["answers"] = json.loads(json.dumps(observation["answers"], default=str),
                                                         parse_constant=lambda value: value)
                     session.history.append(observation)
+                if session.retryable:
+                    await self.backend.refresh()
             session.save()
         return session.snapshot()
 
@@ -285,15 +315,23 @@ class Studio:
                 await self.step(session)
                 if not session.auto_running or session.result is not None:
                     break
-                try:
-                    await asyncio.wait_for(session.pause_event.wait(), timeout=session.delay)
-                    break
-                except asyncio.TimeoutError:
-                    pass
+                shown_at = time.monotonic()
+                while session.auto_running:
+                    remaining = session.delay - (time.monotonic() - shown_at)
+                    if remaining <= 0:
+                        break
+                    session.next_step_at = time.time() + remaining
+                    session.pause_event.clear()
+                    try:
+                        await asyncio.wait_for(session.pause_event.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
+                session.next_step_at = None
         except Exception as exc:
             session.error, session.result = str(exc), "error"
         finally:
             session.auto_running = False
+            session.next_step_at = None
             session.save()
 
     async def close(self) -> None:
@@ -398,15 +436,18 @@ def create_app(config: Config | None = None) -> FastAPI:
                 return session.snapshot()
         session.delay = options.delay
         session.auto_running = True
-        session.pause_event.clear()
         if session.auto_task is None or session.auto_task.done():
+            session.pause_event.clear()
             session.auto_task = asyncio.create_task(studio.automatic(session))
+        else:
+            session.pause_event.set()
         return session.snapshot()
 
     @app.post("/api/sessions/{identifier}/pause")
     async def pause(identifier: str):
         session = studio.session(identifier)
         session.auto_running = False
+        session.next_step_at = None
         session.pause_event.set()
         return session.snapshot()
 
@@ -428,7 +469,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         for path in reports:
             try:
                 data = json.loads(path.read_text())
-                items.append({k: data.get(k) for k in ("id", "scenario", "created_at", "result", "attempts")})
+                item = {k: data.get(k) for k in ("id", "scenario", "created_at", "result", "attempts")}
+                item["live"] = data.get("id") in studio.sessions
+                items.append(item)
             except (OSError, ValueError):
                 continue
         return {"runs": items}
@@ -442,7 +485,8 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/api/runs/{identifier}/images/{name}")
     async def image(identifier: str, name: str):
-        if name != "preview.png" and (len(name) != 6 or not name[:2].isdigit() or name[2:] != ".png"):
+        if name != "preview.png" and (not name.endswith(".png") or not 2 <= len(name[:-4]) <= 6
+                                      or not name[:-4].isdigit()):
             raise HTTPException(404)
         path = run_path(identifier) / name
         if not path.is_file():

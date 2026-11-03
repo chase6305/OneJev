@@ -32,13 +32,17 @@ class StudioIntegrationTests(unittest.TestCase):
             def do_POST(self):
                 payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 self.server.requests.append(payload)
+                if self.server.fail_next:
+                    self.server.fail_next = False
+                    self.send_json({"detail": "temporarily unavailable"}, status=503)
+                    return
                 reply = self.server.replies.pop(0) if self.server.replies else {}
                 self.send_json({"model": "test-model", "answers": reply, "usage": {"input_tokens": 100, "output_tokens": 3},
                                 "onejev": {"timing": {"total_s": 0.01}}})
 
-            def send_json(self, payload):
+            def send_json(self, payload, status=200):
                 data = json.dumps(payload).encode()
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -46,6 +50,7 @@ class StudioIntegrationTests(unittest.TestCase):
 
         cls.model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
         cls.model.requests, cls.model.replies = [], []
+        cls.model.fail_next = False
         cls.thread = threading.Thread(target=cls.model.serve_forever, daemon=True)
         cls.thread.start()
         with socket.socket() as available:
@@ -84,6 +89,7 @@ class StudioIntegrationTests(unittest.TestCase):
 
     def setUp(self):
         self.model.requests, self.model.replies = [], []
+        self.model.fail_next = False
 
     def api(self, path, body=None, expected=200, binary=False):
         request = Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
@@ -167,6 +173,47 @@ class StudioIntegrationTests(unittest.TestCase):
             time.sleep(.02)
         self.assertEqual(state["result"], "verified")
 
+    def test_failed_inference_can_resume_without_repeating_the_payment(self):
+        self.model.replies = [answers(), answers("retry"), answers("paid", .98)]
+        identifier = self.create()
+        self.step(identifier)
+        self.model.fail_next = True
+        failure = self.step(identifier)
+        self.assertTrue(failure["retryable"])
+        self.assertIsNone(failure["result"])
+        self.assertEqual(failure["attempts"], 1)
+        self.assertEqual(failure["history"][-1]["page_status"], "retry")
+        self.assertEqual(failure["history"][-1]["decision"]["action"], "reconnect")
+        recovered = self.step(identifier)
+        self.assertFalse(recovered["retryable"])
+        self.assertIsNone(recovered["error"])
+        self.assertEqual(recovered["attempts"], 1, "Inference retry must not click payment again")
+        self.assertEqual(recovered["history"][-1]["page_status"], "retry")
+        completed = self.step(identifier)
+        self.assertEqual(completed["attempts"], 2)
+        self.assertEqual(completed["result"], "verified")
+
+    def test_speed_change_interrupts_the_current_wait(self):
+        self.model.replies = [answers(), answers("retry"), answers("paid", .98)]
+        identifier = self.create()
+        self.api(f"/api/sessions/{identifier}/auto", {"delay": 10})
+        for _ in range(100):
+            state = self.api(f"/api/sessions/{identifier}")
+            if state["next_step_at"] is not None:
+                break
+            time.sleep(.02)
+        self.assertGreater(state["next_step_at"], time.time())
+        started = time.monotonic()
+        self.api(f"/api/sessions/{identifier}/auto", {"delay": .5})
+        for _ in range(150):
+            state = self.api(f"/api/sessions/{identifier}")
+            if len(state["history"]) >= 2:
+                break
+            time.sleep(.02)
+        self.api(f"/api/sessions/{identifier}/pause", {})
+        self.assertGreaterEqual(len(state["history"]), 2)
+        self.assertLess(time.monotonic() - started, 3.5)
+
     def test_text_and_image_requests_share_the_same_model_connection(self):
         self.model.replies = [{"completed": {"type": "noul", "noul": .97}}]
         text = self.api("/api/ask", {"preset": "completion", "text": "谢谢，问题解决了。", "statement": "问题已经解决。"})
@@ -196,6 +243,108 @@ class StudioIntegrationTests(unittest.TestCase):
         self.assertEqual(state["result"], "error")
         self.assertEqual(state["history"][0]["decision"]["action"], "error")
         self.assertEqual(state["history"][0]["answers"]["completed"]["noul"], "NaN")
+
+    def test_frontend_keeps_session_during_transient_network_failure(self):
+        from playwright.sync_api import sync_playwright
+
+        self.model.replies = [answers()]
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True)
+            try:
+                page = browser.new_page()
+                page.goto(self.base)
+                page.locator("#step").click()
+                page.wait_for_function('document.getElementById("step-count").textContent === "1 步"')
+                identifier = page.evaluate('localStorage.getItem("onejev-studio-session")')
+                page.route("**/api/sessions/*", lambda route: route.abort() if route.request.method == "GET" else route.continue_())
+                page.wait_for_function('document.body.dataset.modelState === "offline"')
+                self.assertEqual(page.evaluate('localStorage.getItem("onejev-studio-session")'), identifier)
+                self.assertIn(identifier, page.locator("#frame").get_attribute("src"))
+                page.unroute("**/api/sessions/*")
+                page.wait_for_function('document.body.dataset.modelState === "ready"')
+                self.assertEqual(page.evaluate('localStorage.getItem("onejev-studio-session")'), identifier)
+                self.assertEqual(page.locator("#step-count").inner_text(), "1 步")
+            finally:
+                browser.close()
+
+    def test_frontend_slow_poll_cannot_replace_a_new_case(self):
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True)
+            try:
+                page = browser.new_page()
+                page.goto(self.base)
+                page.wait_for_function('document.getElementById("frame").naturalWidth > 0')
+                original = page.evaluate('localStorage.getItem("onejev-studio-session")')
+                held = {}
+
+                def delay_poll(route):
+                    if route.request.method == "GET" and not held:
+                        held["route"], held["response"] = route, route.fetch()
+                    else:
+                        route.continue_()
+
+                page.route("**/api/sessions/*", delay_poll)
+                for _ in range(100):
+                    if held:
+                        break
+                    page.wait_for_timeout(20)
+                self.assertIn("route", held)
+                page.locator("#reset").click()
+                page.wait_for_function('(old) => localStorage.getItem("onejev-studio-session") !== old', arg=original)
+                current = page.evaluate('localStorage.getItem("onejev-studio-session")')
+                held["route"].fulfill(response=held["response"])
+                page.wait_for_timeout(150)
+                self.assertEqual(page.evaluate('localStorage.getItem("onejev-studio-session")'), current)
+                self.assertIn(current, page.locator("#frame").get_attribute("src"))
+            finally:
+                browser.close()
+
+    def test_frontend_history_replay_does_not_show_live_playback_controls(self):
+        from playwright.sync_api import sync_playwright
+
+        self.model.replies = [answers()]
+        identifier = None
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True)
+            try:
+                page = browser.new_page()
+                page.goto(self.base)
+                page.wait_for_function('document.getElementById("frame").naturalWidth > 0')
+                identifier = page.evaluate('localStorage.getItem("onejev-studio-session")')
+                self.api(f"/api/sessions/{identifier}/auto", {"delay": 10})
+                page.wait_for_function('document.getElementById("step-count").textContent === "1 步"')
+                page.locator('[data-tab="runs"]').click()
+                page.locator(f'[data-run="{identifier}"]').click()
+                page.wait_for_function('!document.getElementById("panel-browser").hidden')
+                self.assertTrue(page.locator("#pause").is_hidden())
+                self.assertTrue(page.locator("#auto-countdown").is_hidden())
+                self.assertTrue(page.locator("#step").is_disabled())
+            finally:
+                if identifier:
+                    self.api(f"/api/sessions/{identifier}/pause", {})
+                browser.close()
+
+    def test_frontend_invalidates_results_when_image_or_statement_changes(self):
+        from playwright.sync_api import sync_playwright
+
+        self.model.replies = [{"completed": {"type": "noul", "noul": .98}}]
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True)
+            try:
+                page = browser.new_page()
+                page.goto(self.base)
+                page.locator('[data-tab="image"]').click()
+                page.locator("#image-sample").click()
+                page.wait_for_function('!document.getElementById("image-preview").hidden')
+                page.locator("#image-submit").click()
+                page.wait_for_selector("#image-answers .answer-big")
+                page.locator("#image-statement").fill("图片里的发票仍然未付款。")
+                self.assertEqual(page.locator("#image-answers .answer-big").count(), 0)
+                self.assertIn("输入已更改", page.locator("#image-answers").inner_text())
+            finally:
+                browser.close()
 
 
 if __name__ == "__main__":
