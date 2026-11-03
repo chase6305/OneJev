@@ -1,6 +1,6 @@
 # OneJev Studio
 
-一个持续运行的本地交互网站，整合浏览器任务、文本判断、图片判断和运行记录。
+一个持续运行的本地交互网站，整合浏览器任务、文本判断、图片判断、机器人展示和运行记录。
 案例和模型状态都在网页里管理，日常只需要一个启动入口。
 
 ## 启动
@@ -35,7 +35,9 @@ qev studio --inference-python /path/to/inference/.venv/bin/python
 qev studio --backend-url http://model-host:8000 --no-autostart
 ```
 
-## 网页里的四个入口
+## 网页里的功能
+机器人三维工作台也可在同一网站使用，见 [Viser 机器人动作展示](robot.md)。首次安装
+`pip install -e '.[browser,robot]'`，之后仍只需 `qev studio`。
 
 **浏览器任务**：从本地模拟发票开始，提供首次成功、临时失败后重试、明确拒绝、
 重试耗尽和一直处理中五种场景。默认单步控制，每次点击后展示截图、完成概率、

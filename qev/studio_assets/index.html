@@ -7,6 +7,7 @@
     <title>OneJev Studio · 交互实验室</title>
     <link rel="stylesheet" href="/assets/style.css" />
     <script src="/assets/app.js" defer></script>
+    <script src="/assets/robot.js" defer></script>
   </head>
   <body>
     <aside class="sidebar">
@@ -29,6 +30,11 @@
         <button class="nav-item" data-tab="image">
           <span class="nav-icon">▧</span>图片理解<span class="nav-number"
             >03</span
+          >
+        </button>
+        <button class="nav-item" data-tab="robot">
+          <span class="nav-icon">⌁</span>机器人动作<span class="nav-number"
+            >04</span
           >
         </button>
         <button class="nav-item" data-tab="runs">
@@ -191,6 +197,148 @@
           </div>
         </section>
 
+        <section
+          class="tab-panel"
+          id="panel-robot"
+          hidden
+          aria-labelledby="robot-title"
+        >
+          <div class="page-heading">
+            <div>
+              <div class="eyebrow">04 / ROBOT ACTIONS · VISER</div>
+              <h1 id="robot-title">让动作看得见，也能被检查。</h1>
+              <p>
+                把红色方块放入蓝色托盘。三维操作、相机画面和模型判断，在同一个页面里。
+              </p>
+            </div>
+            <span class="local-label">运动学演示 · 非物理仿真</span>
+          </div>
+          <div class="toolbar card robot-toolbar">
+            <button class="primary" id="robot-step">执行：靠近方块</button
+            ><button class="secondary" id="robot-observe">让模型看一眼</button
+            ><button class="secondary" id="robot-auto">▶ 自动演示</button
+            ><button class="secondary" id="robot-reset">↻ 重置场景</button
+            ><label class="robot-check"
+              ><input
+                type="checkbox"
+                id="robot-auto-judge"
+                checked
+              />动作后自动判断</label
+            >
+          </div>
+          <div class="robot-workspace">
+            <div class="robot-visual">
+              <div class="card robot-viewer">
+                <div class="browser-chrome">
+                  <span class="tiny-dot"></span
+                  ><span class="address">Viser · 六轴机械臂与平行夹爪</span
+                  ><span class="badge" id="robot-phase">正在准备场景</span>
+                </div>
+                <iframe
+                  id="robot-viewer"
+                  title="Viser 机器人三维交互视图"
+                  allow="fullscreen"
+                  loading="lazy"
+                ></iframe>
+                <div class="frame-footer">
+                  <span>左键旋转 · 右键平移 · 滚轮缩放</span
+                  ><span id="robot-connection">正在连接三维视图…</span>
+                </div>
+              </div>
+              <div class="robot-faults card">
+                <span>尝试故障</span
+                ><button class="secondary" id="robot-miss">下一次抓空</button
+                ><button class="secondary" id="robot-drop">让方块掉落</button
+                ><button class="secondary" id="robot-shift">移动目标托盘</button
+                ><small id="robot-fault-hint"
+                  >先看正常流程，再观察失败时的判断。</small
+                >
+              </div>
+              <div class="section-row">
+                <h2>模型实际看到的画面</h2>
+                <span id="robot-camera-label" class="muted"
+                  >固定相机 · 与自由视角独立</span
+                >
+              </div>
+              <div class="card robot-camera">
+                <img
+                  id="robot-camera"
+                  alt="发送给 OneJev 的固定相机画面"
+                  hidden
+                />
+                <div id="robot-camera-empty" class="answer-empty">
+                  <span>▧</span>
+                  <p>点击「让模型看一眼」，获取固定相机画面并作判断。</p>
+                </div>
+              </div>
+              <div class="section-row">
+                <h2>视觉检查记录</h2>
+                <button id="robot-latest" class="link-button" hidden>
+                  返回最新
+                </button>
+              </div>
+              <div id="robot-history" class="timeline">
+                <div class="empty-line">还没有视觉检查记录。</div>
+              </div>
+            </div>
+            <aside class="card robot-results">
+              <div class="card-eyebrow">
+                <span class="tiny-dot"></span>视觉判断<span
+                  class="badge"
+                  id="robot-verdict"
+                  >等待观察</span
+                >
+              </div>
+              <div class="robot-prob">
+                <span>方块已放进托盘并释放</span
+                ><strong id="robot-placed">—<small>%</small></strong>
+                <div class="probability-track">
+                  <div id="robot-placed-fill"></div>
+                </div>
+              </div>
+              <div class="robot-prob">
+                <span>夹住方块且已离开桌面</span
+                ><strong id="robot-grasped">—<small>%</small></strong>
+                <div class="probability-track">
+                  <div id="robot-grasped-fill"></div>
+                </div>
+              </div>
+              <div class="decision-divider"></div>
+              <div class="card-eyebrow">独立场景验收</div>
+              <div class="detail-row">
+                <span>夹持并离桌</span
+                ><strong id="robot-truth-grasped">否</strong>
+              </div>
+              <div class="detail-row">
+                <span>放进托盘并释放</span
+                ><strong id="robot-truth-placed">否</strong>
+              </div>
+              <div class="detail-row">
+                <span>本次模型耗时</span><strong id="robot-time">—</strong>
+              </div>
+              <div class="next-action">
+                <small>脚本的下一动作</small
+                ><strong id="robot-next">靠近方块</strong>
+                <p>
+                  动作由预设技能与逆运动学执行。OneJev 读取相机图像作结果检查。
+                </p>
+              </div>
+              <p class="robot-note">
+                场景验收来自物体位置与演示夹持状态，独立于模型结果。这里不模拟接触力、摩擦或真实抓取稳定性。
+              </p>
+              <div
+                id="robot-error"
+                class="inline-error"
+                hidden
+                role="alert"
+              ></div>
+              <details class="raw-details">
+                <summary>查看模型原始结果</summary>
+                <pre id="robot-raw">暂无结果</pre>
+              </details>
+            </aside>
+          </div>
+        </section>
         <section
           class="tab-panel"
           id="panel-text"

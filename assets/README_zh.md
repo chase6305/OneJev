@@ -142,6 +142,9 @@ qev studio
 `python -m playwright install chromium`。网站会复用已有模型服务，或自动启动本机 Flide。
 如果 GPU 推理使用独立环境，首次添加 `--inference-python /path/to/inference/python`，后续无需重复指定。
 
+[Viser 机器人工作台](../examples/robot.md) 在同一网站提供六轴机械臂、抓放技能、故障演示和固定相机的 OneJev 视觉检查。
+首次安装 `pip install -e '.[browser,robot]'`，打开网站的 `/#robot` 页面即可。该版本是运动学展示，不是动力学仿真。
+
 ### 搭配 Playwright 做网页操作验证
 
 [浏览器验证示例](../examples/browser_verify.md#中文使用说明)将网页操作、截图、OneJev 判断和有限次数重试连接起来，

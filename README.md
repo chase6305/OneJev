@@ -152,6 +152,11 @@ Open **http://127.0.0.1:7860**. Installed Chrome is detected automatically; othe
 starts local Flide. If inference uses a different environment, pass
 `--inference-python /path/to/inference/python` once; Studio remembers it locally.
 
+The optional [Viser robot workbench](examples/robot.md) adds a rotatable six-axis arm,
+scripted pick-and-place skills, fault demonstrations and fixed-camera OneJev checks.
+Install `pip install -e '.[browser,robot]'` and open `/#robot` in the same Studio.
+This is a kinematic visualization with independent scene acceptance, not a dynamics simulator.
+
 ### Browser automation with Playwright
 
 The [browser verification example](examples/browser_verify.md) connects page actions,

@@ -244,6 +244,39 @@ class StudioIntegrationTests(unittest.TestCase):
         self.assertEqual(state["history"][0]["decision"]["action"], "error")
         self.assertEqual(state["history"][0]["answers"]["completed"]["noul"], "NaN")
 
+    def test_robot_viewer_uses_one_origin_and_sends_only_camera_input(self):
+        import importlib.util
+        from playwright.sync_api import sync_playwright
+
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        self.model.replies = [{"placed": {"type": "noul", "noul": .02},
+                               "grasped": {"type": "noul", "noul": .03},
+                               "location": {"type": "choice", "choice": "table",
+                                            "probabilities": {"table": .97, "gripper": .02, "tray": .01}}}]
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True,
+                                                  args=["--enable-unsafe-swiftshader"])
+            try:
+                page = browser.new_page(viewport={"width": 1400, "height": 1000})
+                connections = []
+                page.on("websocket", lambda connection: connections.append(connection.url))
+                page.goto(self.base + "/#robot")
+                page.wait_for_function('document.getElementById("robot-connection").textContent.includes("已连接")')
+                page.locator("#robot-observe").click()
+                page.wait_for_function('document.getElementById("robot-history").querySelectorAll("button").length === 1')
+                self.assertTrue(any(url.startswith(self.base.replace("http:", "ws:") + "/robot-ws") for url in connections))
+                self.assertEqual(self.model.requests[-1]["state"]["camera"], "<image:1>")
+                self.assertEqual(set(self.model.requests[-1]["state"]), {"task", "camera"})
+                self.assertTrue(self.model.requests[-1]["media"][0]["data"].startswith("data:image/png;base64,"))
+                self.assertIn("2.0", page.locator("#robot-placed").inner_text())
+                page.locator("#robot-auto-judge").uncheck()
+                page.locator("#robot-step").click()
+                page.wait_for_function('document.getElementById("robot-phase").textContent === "已靠近物体"')
+                self.assertIn("待判断", page.locator("#robot-verdict").inner_text())
+            finally:
+                browser.close()
+
     def test_frontend_keeps_session_during_transient_network_failure(self):
         from playwright.sync_api import sync_playwright
 

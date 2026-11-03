@@ -173,6 +173,7 @@ class Studio:
         self.playwright = None
         self.browser = None
         self.browser_lock = asyncio.Lock()
+        self.close_robot = None
 
     async def get_browser(self):
         async with self.browser_lock:
@@ -335,6 +336,8 @@ class Studio:
             session.save()
 
     async def close(self) -> None:
+        if self.close_robot is not None:
+            await self.close_robot()
         tasks = []
         for session in self.sessions.values():
             session.auto_running = False
@@ -386,6 +389,9 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     app = FastAPI(title="OneJev Studio", lifespan=lifespan)
     app.state.studio = studio
+    from .robot import install_routes
+
+    install_routes(app, studio)
 
     @app.get("/")
     async def index():
@@ -393,7 +399,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/assets/{name}")
     async def asset(name: str):
-        if name not in ("app.js", "style.css"):
+        if name not in ("app.js", "robot.js", "style.css"):
             raise HTTPException(404)
         return FileResponse(ASSETS / name)
 

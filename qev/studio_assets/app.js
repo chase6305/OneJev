@@ -105,9 +105,13 @@ function switchTab(tab) {
     browser: "浏览器任务",
     text: "文本判断",
     image: "图片理解",
+    robot: "机器人动作",
     runs: "运行记录",
   }[tab];
   if (tab === "runs") loadRuns();
+  if (tab === "robot") window.OneJevRobot?.activate();
+  if (tab === "browser" && !session && !working) newSession();
+  history.replaceState(null, "", `#${tab}`);
 }
 document
   .querySelectorAll("[data-tab]")
@@ -602,6 +606,20 @@ async function boot() {
     $("speed-label").textContent = `${speed} 秒`;
   }
   await refreshStatus();
+  if (location.hash === "#robot") {
+    const savedBrowser = localStorage.getItem("onejev-studio-session");
+    if (savedBrowser) {
+      try {
+        applySession(await api(`/api/sessions/${savedBrowser}`));
+      } catch (error) {
+        if (error.status !== 404)
+          toast("浏览器案例暂时无法恢复，机器人视图仍可使用。");
+      }
+    }
+    switchTab("robot");
+    poll();
+    return;
+  }
   const saved = localStorage.getItem("onejev-studio-session");
   if (saved)
     try {
