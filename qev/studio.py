@@ -399,7 +399,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/assets/{name}")
     async def asset(name: str):
-        if name not in ("app.js", "robot.js", "style.css"):
+        if name not in ("app.js", "robot.js", "robot-view.js", "robot-view.css", "style.css"):
             raise HTTPException(404)
         return FileResponse(ASSETS / name)
 

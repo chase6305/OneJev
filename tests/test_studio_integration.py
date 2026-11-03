@@ -250,7 +250,7 @@ class StudioIntegrationTests(unittest.TestCase):
 
         if importlib.util.find_spec("viser") is None:
             self.skipTest("install the robot optional dependencies")
-        self.api("/api/robot/reset", {})
+        self.api("/api/robot/reset", {"scenario": "normal"})
         self.model.replies = [{"placed": {"type": "noul", "noul": .02},
                                "grasped": {"type": "noul", "noul": .03},
                                "location": {"type": "choice", "choice": "table",
@@ -278,19 +278,108 @@ class StudioIntegrationTests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_robot_case_picker_clean_mobile_view_and_network_recovery_preserve_scene(self):
+        import importlib.util
+        from playwright.sync_api import sync_playwright
+
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        initial = self.api("/api/robot/reset", {"scenario": "normal"})
+        self.api("/api/robot/settings", {"judge": True, "motion_speed": 2})
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True,
+                                                 args=["--enable-unsafe-swiftshader"])
+            try:
+                page = browser.new_page(viewport={"width": 390, "height": 844})
+                errors = []
+                page.on("pageerror", lambda error: errors.append(str(error)))
+                page.goto(self.base + "/#robot")
+                page.wait_for_function('!document.getElementById("robot-camera-reset").disabled')
+                frame = page.frame_locator("#robot-viewer")
+                sheet = frame.locator('.mantine-Paper-root[style*="position: fixed"][style*="max-height: 60%"]')
+                sheet.wait_for(state="attached")
+                self.assertEqual(sheet.count(), 1)
+                self.assertFalse(sheet.is_visible())
+                page.locator("#robot-view-settings").click()
+                page.wait_for_function('document.getElementById("robot-view-settings").getAttribute("aria-expanded") === "true"')
+                sheet.wait_for(state="visible")
+                self.assertTrue(sheet.is_visible())
+                page.locator("#robot-view-settings").click()
+                sheet.wait_for(state="hidden")
+                page.locator("#robot-camera-reset").click()
+                self.assertEqual(self.api("/api/robot")["revision"], initial["revision"])
+                held = []
+                page.route("**/api/robot/settings", lambda route: held.append(route))
+                page.locator("#robot-auto-judge").uncheck()
+                self.assertFalse(page.locator("#robot-auto-judge").is_checked())
+                self.assertTrue(page.locator("#robot-step").is_disabled())
+                page.wait_for_function('document.getElementById("robot-auto-judge").disabled')
+                self.assertEqual(len(held), 1)
+                held[0].continue_()
+                page.unroute("**/api/robot/settings")
+                page.wait_for_function('!document.getElementById("robot-step").disabled')
+                self.assertFalse(self.api("/api/robot")["auto_judge"])
+                page.locator("#robot-scenario").select_option("miss")
+                page.locator("#robot-load-scenario").click()
+                page.wait_for_function('document.getElementById("robot-case-title").textContent === "抓空后重试"')
+                loaded = self.api("/api/robot")
+                self.assertNotEqual(loaded["id"], initial["id"])
+                page.locator("#robot-step").click()
+                page.wait_for_function('document.getElementById("robot-step").textContent.includes("设置抓空")')
+                page.locator("#robot-step").click()
+                page.wait_for_function('document.getElementById("robot-fault-hint").textContent.includes("已设置")')
+                fault = self.api("/api/robot")
+                self.assertEqual(fault["events"][-1]["kind"], "fault")
+                page.route("**/api/robot", lambda route: route.abort() if route.request.method == "GET" else route.continue_())
+                page.wait_for_function('!document.getElementById("robot-network-error").hidden')
+                self.assertTrue(page.locator("#robot-step").is_disabled())
+                page.unroute("**/api/robot")
+                page.wait_for_function('document.getElementById("robot-network-error").hidden && !document.getElementById("robot-step").disabled')
+                page.locator("#robot-view-reconnect").click()
+                page.wait_for_function('!document.getElementById("robot-camera-reset").disabled')
+                after = self.api("/api/robot")
+                self.assertEqual(after["id"], fault["id"])
+                self.assertEqual(after["revision"], fault["revision"])
+                self.assertEqual(after["q"], fault["q"])
+                self.assertFalse(self.model.requests)
+                self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+                self.assertFalse(errors)
+            finally:
+                browser.close()
+
+    def test_robot_drop_preset_completes_with_recorded_fault_and_recovery(self):
+        import importlib.util
+
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        state = self.api("/api/robot/reset", {"scenario": "drop"})
+        self.api("/api/robot/settings", {"judge": False, "motion_speed": 2})
+        for _ in range(10):
+            if state["next_action"] is None:
+                break
+            state = self.api("/api/robot/step", {"run_id": state["id"], "expected_revision": state["revision"], "judge": False})
+        self.assertEqual(state["phase"], "complete")
+        self.assertTrue(state["truth"]["placed"])
+        self.assertTrue(state["scenario"]["fault_done"])
+        self.assertEqual(len([e for e in state["events"] if e["kind"] == "fault"]), 1)
+        self.assertTrue(any(e["label"] == "重新抓取" for e in state["events"]))
+        self.assertFalse(state["history"])
+        self.assertFalse(self.model.requests)
+        self.api("/api/robot/reset", {"scenario": "unknown"}, expected=422)
+
     def test_robot_archived_replay_is_read_only_and_stale_controls_are_rejected(self):
         import importlib.util
 
         if importlib.util.find_spec("viser") is None:
             self.skipTest("install the robot optional dependencies")
-        initial = self.api("/api/robot/reset", {})
+        initial = self.api("/api/robot/reset", {"scenario": "normal"})
         self.api("/api/robot/settings", {"judge": False, "motion_speed": 2})
         stale = {"run_id": initial["id"], "expected_revision": initial["revision"], "judge": False}
         moved = self.api("/api/robot/step", stale)
         self.api("/api/robot/step", stale, expected=409)
         self.assertEqual(moved["phase"], "hover")
         self.assertEqual(len(moved["events"]), 2)
-        current = self.api("/api/robot/reset", {})
+        current = self.api("/api/robot/reset", {"scenario": "normal"})
         replay = self.api("/api/robot/replay", {"source_id": initial["id"], "event_index": 1})
         self.assertEqual(replay["id"], current["id"])
         self.assertEqual(replay["phase"], "ready")
@@ -315,7 +404,7 @@ class StudioIntegrationTests(unittest.TestCase):
 
         if importlib.util.find_spec("viser") is None:
             self.skipTest("install the robot optional dependencies")
-        self.api("/api/robot/reset", {})
+        self.api("/api/robot/reset", {"scenario": "normal"})
         self.api("/api/robot/settings", {"judge": False, "delay": 15, "motion_speed": 2})
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True,

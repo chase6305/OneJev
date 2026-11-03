@@ -54,12 +54,13 @@ const pct = (value) =>
   Number.isFinite(value) ? (value * 100).toFixed(1) : "—";
 const ms = (value) =>
   Number.isFinite(value) ? `${Math.round(value * 1000)} ms` : "—";
-async function api(path, body) {
+async function api(path, body, options = {}) {
   const response = await fetch(
     path,
     body === undefined
-      ? {}
+      ? options
       : {
+          ...options,
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),

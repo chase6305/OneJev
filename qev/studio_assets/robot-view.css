@@ -1,0 +1,9 @@
+/* Viser exposes desktop panel test ids for embedding/user tooling. Its mobile
+   bottom sheet uses Mantine's Paper with these fixed layout styles (1.1).
+   Scope both selectors to this embedded client and keep diagnostics visible. */
+html[data-onejev-embedded="true"][data-onejev-controls="false"]
+  [data-testid="floating-panel"],
+html[data-onejev-embedded="true"][data-onejev-controls="false"]
+  .mantine-Paper-root[style*="position: fixed"][style*="max-height: 60%"] {
+  display: none !important;
+}

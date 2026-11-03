@@ -20,6 +20,16 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 场景使用程序生成的简化六轴机械臂和平行夹爪，不需要下载额外的机器人模型。
 可用鼠标旋转、缩放和平移三维视图。
 
+上方“选择一个案例”提供四个预设：正常抓放、抓空后重试、掉落后恢复和目标移动。
+点击“载入案例”会创建一条新记录，然后可逐步执行或开始自动演示。每次预设故障都会
+作为独立步骤出现并停留，不必手动把握注入时机；故障与恢复都进入轨迹记录。
+“重置场景”会重新载入当前案例。手动故障按钮仍可使用；手动注入同一预设故障后，
+脚本不会再重复注入。
+
+三维视图中的原生设置面板默认收起，可点击“视图设置”显示或隐藏。“复位视角”只恢复
+本标签页的相机视角，“重连视图”只重新连接三维页面，两者都不会重置机械臂或推进动作。
+“放大三维视图”进入全屏；按 Escape 或点击退出全屏返回。手机端同样可以使用这些控制。
+
 “执行下一动作”会依次运行靠近、闭合夹爪、抬起、放入托盘和收回机械臂。
 逆运动学计算目标关节位置，动作以平滑关节插值展示。开启“动作后自动判断”时，
 每个技能结束后会请求固定相机渲染，并调用已有 OneJev 服务。
@@ -33,6 +43,11 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 重新进入会显示当前进度；要停止后续动作，请点击“暂停演示”。同一 Studio 的多个页面
 共享播放、调速、故障和回放状态；过期页面的动作请求会被拒绝并刷新状态。
 速度、停留时间和自动判断选项会保存在本地，重启网站后继续使用，但不会自动恢复执行。
+
+网站连接中断时，会显示提示并暂时禁用场景操作，恢复连接后重新同步同一条记录。
+服务端的自动演示可能仍在继续，不会因为浏览器暂时断线而重复开始。
+如需暂停，恢复连接后点击“暂停演示”。只有一份浏览器三维视图时，关闭该视图会使
+后续相机检查无法完成，自动演示会按原有错误处理暂停。
 
 ## 故障与恢复
 
@@ -102,6 +117,11 @@ Playback runs once on the server across tabs, with adjustable speed and dwell ti
 Completed actions and faults are recorded even without inference. Replay recorded 3D
 poses or archived runs without executing skills or changing the live scene; return to
 the live scene to continue. Reports and preferences persist locally across restarts.
+Four presets schedule normal placement, missed-grasp recovery, dropped-object recovery
+and shifted-target placement; each fault remains a separate observable step. View
+settings start hidden on desktop and mobile. Camera reset, viewer reconnect and full
+screen operate on the view without resetting the robot. Temporary network failures
+disable scene controls until the current run has been synchronized again.
 
 OneJev receives a fixed-camera render and the task text, while scene acceptance is
 displayed independently. Model uncertainty and disagreement stay visible. This is a

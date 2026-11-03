@@ -213,6 +213,35 @@
             </div>
             <span class="local-label">运动学演示 · 非物理仿真</span>
           </div>
+          <div class="card robot-case">
+            <div class="robot-case-picker">
+              <label for="robot-scenario">选择一个案例</label>
+              <select id="robot-scenario">
+                <option value="normal">01 · 正常抓放</option>
+                <option value="miss">02 · 抓空后重试</option>
+                <option value="drop">03 · 掉落后恢复</option>
+                <option value="shift">04 · 目标移动</option>
+              </select>
+              <button id="robot-load-scenario" class="secondary">
+                载入案例
+              </button>
+            </div>
+            <div class="robot-case-guide">
+              <strong id="robot-case-title">正常抓放</strong>
+              <p id="robot-case-description">
+                载入后可逐步执行或自动演示，故障会在预设时机出现。
+              </p>
+              <span id="robot-case-progress" role="status">从初始场景开始</span>
+            </div>
+          </div>
+          <div
+            id="robot-network-error"
+            class="inline-error"
+            role="alert"
+            hidden
+          >
+            无法连接工作台，操作已暂时禁用。自动演示可能仍在服务端继续，连接恢复后可暂停。
+          </div>
           <div class="toolbar card robot-toolbar">
             <button class="primary" id="robot-step">执行：靠近方块</button
             ><button class="secondary" id="robot-observe">让模型看一眼</button
@@ -265,6 +294,24 @@
                   <span class="tiny-dot"></span
                   ><span class="address">Viser · 六轴机械臂与平行夹爪</span
                   ><span class="badge" id="robot-phase">正在准备场景</span>
+                </div>
+                <div class="robot-view-tools">
+                  <button id="robot-camera-reset" class="link-button">
+                    复位视角
+                  </button>
+                  <button
+                    id="robot-view-settings"
+                    class="link-button"
+                    aria-expanded="false"
+                  >
+                    视图设置
+                  </button>
+                  <button id="robot-view-reconnect" class="link-button">
+                    重连视图
+                  </button>
+                  <button id="robot-fullscreen" class="link-button">
+                    放大三维视图
+                  </button>
                 </div>
                 <iframe
                   id="robot-viewer"
@@ -326,7 +373,9 @@
                 />
                 <div id="robot-camera-empty" class="answer-empty">
                   <span>▧</span>
-                  <p>点击「让模型看一眼」，获取固定相机画面并作判断。</p>
+                  <p id="robot-camera-empty-message">
+                    点击「让模型看一眼」，获取固定相机画面并作判断。
+                  </p>
                 </div>
               </div>
               <div class="section-row">

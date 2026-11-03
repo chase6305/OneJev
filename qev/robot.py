@@ -17,7 +17,7 @@ from typing import Literal
 from uuid import uuid4
 
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from .browser import probability
@@ -26,6 +26,12 @@ from .client import Choice, Noul
 PHASES = {"ready": "等待开始", "hover": "已靠近物体", "grasped": "夹爪已闭合", "lifted": "已抬起", "dropped": "物体掉落", "placed": "已放置", "complete": "动作结束"}
 SKILLS = {"approach": "靠近方块", "grasp": "闭合夹爪", "lift": "抬起方块", "place": "放入托盘", "recover": "重新抓取", "retreat": "收回机械臂"}
 FAULTS = {"miss": "设置抓空", "drop": "方块掉落", "shift": "移动托盘"}
+SCENARIOS = {
+    "normal": {"name": "正常抓放", "description": "看机械臂靠近、抓住、抬起方块，放入托盘后收回。", "fault": None},
+    "miss": {"name": "抓空后重试", "description": "靠近后设置一次抓空；观察空夹爪抬起，再重新抓取并放置。", "fault": "miss", "phase": "hover"},
+    "drop": {"name": "掉落后恢复", "description": "抓住并抬起后模拟一次掉落；观察机械臂重新抓取并完成放置。", "fault": "drop", "phase": "lifted"},
+    "shift": {"name": "目标移动", "description": "抬起方块后移动托盘；后续放置使用新的目标位置。", "fault": "shift", "phase": "lifted"},
+}
 
 
 def agreement(record):
@@ -137,8 +143,12 @@ class RobotWorld:
         self.pause_reason = None
         self.reset()
 
-    def reset(self):
+    def reset(self, scenario=None):
         np = self.np
+        scenario = scenario or getattr(self, "scenario", "normal")
+        if scenario not in SCENARIOS:
+            raise HTTPException(422, "未知的机器人案例")
+        self.scenario, self.scenario_fault_done = scenario, False
         self.id = uuid4().hex
         self.path = self.root / self.id
         self.path.mkdir()
@@ -169,6 +179,22 @@ class RobotWorld:
         return {"ready": "approach", "hover": "grasp", "grasped": "lift", "dropped": "recover", "placed": "retreat"}.get(
             self.phase, ("place" if self.attached else "recover") if self.phase == "lifted" else None)
 
+    def next_action(self):
+        case = SCENARIOS[self.scenario]
+        fault = case["fault"]
+        if fault and not self.scenario_fault_done and self.phase == case["phase"]:
+            if fault != "drop" or self.truth()["grasped"]:
+                return {"kind": "fault", "name": fault, "label": FAULTS[fault]}
+        skill = self.next_skill()
+        return {"kind": "skill", "name": skill, "label": SKILLS[skill]} if skill else None
+
+    async def advance(self):
+        action = self.next_action()
+        if action and action["kind"] == "fault":
+            await self.inject(action["name"])
+            return action["name"]
+        return await self.execute()
+
     def snapshot(self):
         return {"id": self.id, "phase": self.phase, "phase_label": PHASES[self.phase],
                 "next_skill": self.next_skill(), "busy": self.busy, "attached": self.attached,
@@ -179,7 +205,9 @@ class RobotWorld:
                 "schema_version": 2, "created_at": self.created_at, "events": self.events,
                 "replay": self.replay, "auto_running": self.auto_running, "delay": self.delay,
                 "motion_speed": self.motion_speed, "auto_judge": self.auto_judge,
-                "next_step_at": self.next_step_at, "pause_reason": self.pause_reason}
+                "next_step_at": self.next_step_at, "pause_reason": self.pause_reason,
+                "next_action": self.next_action(), "scenario": {"key": self.scenario,
+                    **SCENARIOS[self.scenario], "fault_done": self.scenario_fault_done}}
 
     def viewers(self):
         ready = {}
@@ -349,6 +377,8 @@ class RobotWorld:
             self.tray[0] = -.17 if self.tray[0] > -.10 else -.02
         self.revision += 1
         self.draw()
+        if kind == SCENARIOS[self.scenario]["fault"]:
+            self.scenario_fault_done = True
         self.record_event("fault", FAULTS[kind], time.perf_counter() - started)
 
     async def observe(self, client):
@@ -413,6 +443,10 @@ class RobotFault(RobotControl):
     kind: Literal["miss", "drop", "shift"]
 
 
+class RobotScenario(RobotControl):
+    scenario: Literal["normal", "miss", "drop", "shift"] | None = None
+
+
 class RobotPlayback(RobotAction):
     delay: float = Field(default=3, ge=.5, le=15, allow_inf_nan=False)
     motion_speed: float = Field(default=1, ge=.25, le=2, allow_inf_nan=False)
@@ -473,7 +507,7 @@ class RobotController:
             raise HTTPException(409, "当前动作正在结束，请稍候")
         if live.replay:
             raise HTTPException(409, "请先返回当前场景，再开始演示")
-        if not live.next_skill():
+        if not live.next_action():
             raise HTTPException(409, "动作已结束，请重置场景")
         if options.judge and self.backend.state != "ready":
             raise HTTPException(409, "请等待模型就绪，或关闭动作后自动判断")
@@ -508,15 +542,15 @@ class RobotController:
     async def autoplay(self):
         live = self.live
         try:
-            while live.auto_running and live.next_skill():
-                await self.operate(lambda w: w.execute(), RobotControl(), judge=live.auto_judge, from_auto=True)
+            while live.auto_running and live.next_action():
+                await self.operate(lambda w: w.advance(), RobotControl(), judge=live.auto_judge, from_auto=True)
                 if live.error:
                     live.pause_reason = "视觉请求未完成，演示已暂停"
                     break
                 if live.auto_judge and agreement(live.history[-1] if live.history else None) != "判断与场景一致":
                     live.pause_reason = "模型判断需要复核，演示已暂停；可检查画面或手动执行"
                     break
-                if not live.next_skill():
+                if not live.next_action():
                     live.pause_reason = "动作已完成"
                     break
                 completed = time.monotonic()
@@ -590,7 +624,12 @@ def install_routes(app, studio):
     async def viewer():
         live = await world()
         path = Path(live.viser.__file__).parent / "client/build/index.html"
-        return FileResponse(path)
+        # Keep the installed Viser client intact. The adapter only changes its
+        # embedded controls; scene rendering and WebSocket messages stay native.
+        content = path.read_text(encoding="utf-8").replace(
+            "</head>", '<link rel="stylesheet" href="/assets/robot-view.css">'
+            '<script src="/assets/robot-view.js" defer></script></head>', 1)
+        return HTMLResponse(content, headers={"Cache-Control": "no-cache"})
 
     @app.websocket("/robot-ws")
     async def proxy(websocket: WebSocket):
@@ -634,7 +673,7 @@ def install_routes(app, studio):
 
     @app.post("/api/robot/step")
     async def step(options: RobotAction):
-        return await (await controller()).operate(lambda live: live.execute(), options, judge=options.judge)
+        return await (await controller()).operate(lambda live: live.advance(), options, judge=options.judge)
 
     @app.post("/api/robot/observe")
     async def observe(options: RobotControl = RobotControl()):
@@ -643,9 +682,9 @@ def install_routes(app, studio):
         return await (await controller()).operate(noop, options, judge=True)
 
     @app.post("/api/robot/reset")
-    async def reset(options: RobotControl = RobotControl()):
+    async def reset(options: RobotScenario = RobotScenario()):
         async def action(live):
-            live.reset()
+            live.reset(options.scenario)
         return await (await controller()).operate(action, options)
 
     @app.post("/api/robot/fault")
@@ -681,7 +720,8 @@ def install_routes(app, studio):
                 report = read_report(live.root, path.parent.name)
                 reports.append({"id": report["id"], "created_at": report.get("created_at"),
                                 "phase_label": report["phase_label"], "events": len(report.get("events", [])),
-                                "checks": len(report.get("history", []))})
+                                "checks": len(report.get("history", [])),
+                                "scenario": report.get("scenario", {}).get("name", "自由演示")})
             except (HTTPException, KeyError, TypeError):
                 continue
             if len(reports) >= 100:

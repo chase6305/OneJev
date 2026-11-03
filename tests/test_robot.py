@@ -255,6 +255,60 @@ class RobotSkillTests(unittest.IsolatedAsyncioTestCase):
         finally:
             restarted.close()
 
+    async def test_presets_inject_one_fault_and_finish_the_expected_recovery_path(self):
+        for scenario, expected_skills in (
+            ("normal", ["靠近方块", "闭合夹爪", "抬起方块", "放入托盘", "收回机械臂"]),
+            ("miss", ["靠近方块", "闭合夹爪", "抬起方块", "重新抓取", "放入托盘", "收回机械臂"]),
+            ("drop", ["靠近方块", "闭合夹爪", "抬起方块", "重新抓取", "放入托盘", "收回机械臂"]),
+            ("shift", ["靠近方块", "闭合夹爪", "抬起方块", "放入托盘", "收回机械臂"]),
+        ):
+            with self.subTest(scenario=scenario):
+                self.world.reset(scenario)
+                for _ in range(10):
+                    if not self.world.next_action():
+                        break
+                    await self.world.advance()
+                self.assertEqual(self.world.phase, "complete")
+                self.assertTrue(self.world.truth()["placed"])
+                self.assertEqual([e["label"] for e in self.world.events if e["kind"] == "skill"], expected_skills)
+                faults = [e for e in self.world.events if e["kind"] == "fault"]
+                self.assertEqual(len(faults), 0 if scenario == "normal" else 1)
+                if scenario == "drop":
+                    self.assertEqual(faults[0]["pose"]["phase"], "dropped")
+                    self.assertFalse(faults[0]["truth"]["grasped"])
+                if scenario == "shift":
+                    self.assertAlmostEqual(self.world.cube[0], -.17)
+
+    async def test_manual_fault_satisfies_the_same_planned_fault_without_repeating_it(self):
+        self.world.reset("miss")
+        await self.world.inject("miss")
+        while self.world.next_action():
+            await self.world.advance()
+        self.assertEqual(len([e for e in self.world.events if e["kind"] == "fault"]), 1)
+        self.assertTrue(self.world.truth()["placed"])
+        self.world.reset()
+        self.assertEqual(self.world.scenario, "miss")
+        self.assertFalse(self.world.scenario_fault_done)
+
+    async def test_preset_automatic_playback_executes_the_fault_as_a_separate_step(self):
+        self.world.reset("miss")
+        await self.world.advance()
+        self.assertEqual(self.world.next_action()["kind"], "fault")
+        await self.controller.start(RobotPlayback(judge=False, delay=15))
+        await self.wait_until(lambda: self.world.scenario_fault_done)
+        self.controller.pause(RobotControl())
+        await self.controller.auto_task
+        self.assertEqual(self.world.phase, "hover")
+        self.assertTrue(self.world.miss_next)
+        self.assertEqual(self.world.events[-1]["kind"], "fault")
+        self.assertEqual(self.world.next_action()["name"], "grasp")
+
+    async def test_unknown_scenario_does_not_create_a_new_run(self):
+        initial = self.world.id
+        with self.assertRaises(HTTPException):
+            self.world.reset("unknown")
+        self.assertEqual(self.world.id, initial)
+
 
 if __name__ == "__main__":
     unittest.main()
