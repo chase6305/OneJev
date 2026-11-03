@@ -158,6 +158,8 @@ Its one-click full demo automatically runs a selected preset, including visual c
 while retaining uncertain judgments for review; supervised playback can pause on them.
 Play a preset or all four cases for 1–20 rounds, with per-case reports and an archived
 summary. Transient visual failures retry the same observation without repeating motion.
+A managed private camera keeps visual checks running after the interactive page closes.
+If its browser is unavailable, Studio explicitly falls back to a connected page viewer.
 Install `pip install -e '.[browser,robot]'` and open `/#robot` in the same Studio.
 This is a kinematic visualization with independent scene acceptance, not a dynamics simulator.
 

@@ -36,6 +36,9 @@ class StudioIntegrationTests(unittest.TestCase):
                     self.server.fail_next = False
                     self.send_json({"detail": "temporarily unavailable"}, status=503)
                     return
+                if self.server.delay_next:
+                    delay, self.server.delay_next = self.server.delay_next, 0
+                    time.sleep(delay)
                 reply = self.server.replies.pop(0) if self.server.replies else {}
                 self.send_json({"model": "test-model", "answers": reply, "usage": {"input_tokens": 100, "output_tokens": 3},
                                 "onejev": {"timing": {"total_s": 0.01}}})
@@ -51,6 +54,7 @@ class StudioIntegrationTests(unittest.TestCase):
         cls.model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
         cls.model.requests, cls.model.replies = [], []
         cls.model.fail_next = False
+        cls.model.delay_next = 0
         cls.thread = threading.Thread(target=cls.model.serve_forever, daemon=True)
         cls.thread.start()
         with socket.socket() as available:
@@ -90,6 +94,7 @@ class StudioIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.model.requests, self.model.replies = [], []
         self.model.fail_next = False
+        self.model.delay_next = 0
 
     def api(self, path, body=None, expected=200, binary=False):
         request = Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
@@ -438,6 +443,121 @@ class StudioIntegrationTests(unittest.TestCase):
                 self.assertFalse(result["pending_observation"])
                 self.assertIsNone(result["error"])
                 self.assertTrue(page.locator("#robot-check-errors").is_visible())
+            finally:
+                browser.close()
+
+    def test_robot_managed_camera_finishes_without_an_interactive_browser(self):
+        import importlib.util
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        self.api("/api/robot/reset", {"scenario": "normal"})
+        self.model.replies = [{"placed": {"type": "noul", "noul": .42}, "grasped": {"type": "noul", "noul": .25}}] * 5
+        self.api("/api/robot/demo", {"judge": True, "delay": .5, "motion_speed": 2})
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            state = self.api("/api/robot")
+            if not state["auto_running"]:
+                break
+            time.sleep(.1)
+        self.assertEqual(state["phase"], "complete", state.get("error"))
+        self.assertEqual(state["clients"], 0)
+        self.assertEqual(state["capture"]["mode"], "managed")
+        self.assertTrue(state["capture"]["ready"])
+        self.assertEqual(len(state["history"]), 5)
+        self.assertTrue(state["truth"]["placed"])
+
+    def test_robot_shows_inference_stage_and_separate_camera_timing(self):
+        import importlib.util
+        from playwright.sync_api import sync_playwright
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        self.api("/api/robot/reset", {"scenario": "normal"})
+        self.model.replies = [{"placed": {"type": "noul", "noul": .01}, "grasped": {"type": "noul", "noul": .02}}]
+        self.model.delay_next = 3
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True,
+                                                 args=["--enable-unsafe-swiftshader"])
+            try:
+                page = browser.new_page(viewport={"width": 1400, "height": 1000})
+                page.goto(self.base + "/#robot")
+                page.wait_for_function('!document.getElementById("robot-observe").disabled')
+                page.locator("#robot-observe").click()
+                page.wait_for_function('document.getElementById("robot-phase").textContent.includes("模型视觉判断")')
+                self.assertEqual(self.api("/api/robot")["activity"]["kind"], "inference")
+                page.wait_for_function('!document.getElementById("robot-observe").disabled')
+                state = self.api("/api/robot")
+                self.assertIsNone(state["activity"])
+                self.assertGreater(state["history"][0]["capture_s"], 0)
+                self.assertGreaterEqual(state["history"][0]["request_s"], 3)
+                self.assertIn("ms", page.locator("#robot-capture-time").inner_text())
+                self.assertIn("内置相机", page.locator("#robot-capture-mode").inner_text())
+            finally:
+                browser.close()
+
+    def test_robot_late_progress_poll_cannot_replace_a_finished_manual_check(self):
+        import importlib.util
+        from playwright.sync_api import sync_playwright
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        self.api("/api/robot/reset", {"scenario": "normal"})
+        self.model.replies = [{"placed": {"type": "noul", "noul": .01}, "grasped": {"type": "noul", "noul": .02}}]
+        self.model.delay_next = 2
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True,
+                                                 args=["--enable-unsafe-swiftshader"])
+            try:
+                page = browser.new_page(viewport={"width": 1400, "height": 1000})
+                page.goto(self.base + "/#robot")
+                page.wait_for_function('!document.getElementById("robot-observe").disabled')
+                held = []
+                def hold_progress(route):
+                    if route.request.method == "GET" and not held:
+                        response = route.fetch()
+                        if response.json().get("busy"):
+                            held.append((route, response))
+                            return
+                        route.fulfill(response=response)
+                    else:
+                        route.continue_()
+                page.route("**/api/robot", hold_progress)
+                page.locator("#robot-observe").click()
+                page.wait_for_function('document.getElementById("robot-history").querySelectorAll("button").length === 1 && !document.getElementById("robot-observe").disabled')
+                self.assertEqual(len(held), 1)
+                held[0][0].fulfill(response=held[0][1])
+                page.wait_for_timeout(100)
+                self.assertEqual(page.locator("#robot-phase").inner_text(), "等待开始")
+                self.assertFalse(page.locator("#robot-observe").is_disabled())
+            finally:
+                browser.close()
+
+    def test_robot_stopped_playlist_replay_uses_its_saved_checkpoint(self):
+        import importlib.util
+        from playwright.sync_api import sync_playwright
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        self.api("/api/robot/demo", {"sequence": "all", "judge": False, "delay": 15, "motion_speed": 2})
+        for _ in range(100):
+            state = self.api("/api/robot")
+            if state["phase"] == "hover" and not state["busy"]:
+                break
+            time.sleep(.05)
+        self.api("/api/robot/stop", {})
+        time.sleep(.1)
+        self.api("/api/robot/step", {"judge": False})
+        self.assertEqual(self.api("/api/robot")["phase"], "grasped")
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True,
+                                                 args=["--enable-unsafe-swiftshader"])
+            try:
+                page = browser.new_page(viewport={"width": 1400, "height": 1000})
+                page.goto(self.base + "/#robot")
+                page.locator("[data-playlist-run]").first.click()
+                page.wait_for_function('!document.getElementById("robot-replay-notice").hidden')
+                state = self.api("/api/robot")
+                self.assertEqual(state["phase"], "grasped")
+                self.assertEqual(state["replay"]["pose"]["phase"], "hover")
+                self.assertEqual(state["playlist"]["items"][0]["steps"], 1)
+                self.api("/api/robot/live", {})
             finally:
                 browser.close()
 

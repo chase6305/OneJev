@@ -26,8 +26,9 @@ window.OneJevRobot = (() => {
     runsLoaded = false,
     loadingArchive = null;
   const active = () => !$("panel-robot").hidden;
+  const sceneAvailable = () => state?.clients > 0 || state?.capture?.ready;
   const isReady = () =>
-    document.body.dataset.modelState === "ready" && state?.clients > 0;
+    document.body.dataset.modelState === "ready" && sceneAvailable();
   const robotApi = (path, body) =>
     api(path, body, {
       signal: AbortSignal.timeout(body === undefined ? 8000 : 90000),
@@ -120,9 +121,11 @@ window.OneJevRobot = (() => {
       : replay
         ? "历史姿态 · 不执行动作"
         : busy
-          ? state.retrying_observation
-            ? "正在重试视觉检查…"
-            : "正在执行技能…"
+          ? state.activity
+            ? `${state.activity.label} · ${Math.max(0, Math.floor(Date.now() / 1000 - state.activity.started_at))} 秒`
+            : state.retrying_observation
+              ? "正在重试视觉检查…"
+              : "正在执行技能…"
           : state.phase_label;
     $("robot-connection").textContent = !online
       ? "工作台连接中断"
@@ -146,7 +149,7 @@ window.OneJevRobot = (() => {
       auto ||
       !!replay ||
       !nextLabel ||
-      !state.clients ||
+      !sceneAvailable() ||
       (state.pending_observation && requireModel) ||
       (requireModel && !isReady());
     $("robot-observe").disabled = busy || auto || !!replay || !isReady();
@@ -164,7 +167,7 @@ window.OneJevRobot = (() => {
           (!nextLabel &&
             !nextCase &&
             !(state.pending_observation && requireModel)) ||
-          !state.clients ||
+          !sceneAvailable() ||
           (requireModel && !isReady())));
     $("robot-miss").disabled =
       busy || auto || !!replay || !["ready", "hover"].includes(state.phase);
@@ -198,7 +201,7 @@ window.OneJevRobot = (() => {
       busy ||
       auto ||
       !!replay ||
-      !state.clients ||
+      !sceneAvailable() ||
       (requireModel && !isReady());
     const plannedCases =
       ($("robot-sequence").value === "all" ? 4 : 1) *
@@ -283,6 +286,9 @@ window.OneJevRobot = (() => {
     $("robot-verdict").className =
       `badge ${fresh && agreement(record) === "判断与场景一致" ? "good" : fresh ? "bad" : ""}`;
     $("robot-time").textContent = fresh ? ms(record.request_s) : "—";
+    $("robot-capture-time").textContent = fresh ? ms(record.capture_s) : "—";
+    $("robot-capture-mode").textContent =
+      state.capture?.message || "使用页面相机";
     $("robot-error").hidden = !state.error;
     $("robot-error").textContent = state.error || "";
     renderPlaylist(busy, auto);
@@ -380,6 +386,7 @@ window.OneJevRobot = (() => {
       completed: "已完成",
       stopped: "已结束",
       pending: "等待播放",
+      interrupted: "已中断",
     };
     $("robot-playlist").hidden = !playlist && !playlistCount;
     $("robot-playlist-select").value = playlistSelection;
@@ -404,7 +411,7 @@ window.OneJevRobot = (() => {
     $("robot-playlist-rows").innerHTML = items
       .map(
         (item, index) =>
-          `<tr class="${(state.replay ? item.run_id === state.replay.run_id : !playlistSelection && index === playlist.index) ? "current" : ""}"><td>${item.round} / ${esc(item.name)}<small class="robot-playlist-case-status">${esc(labels[item.status] || item.status)}</small></td><td>${esc(labels[item.status] || item.status)}</td><td>${item.checks || 0} / ${item.reviews || 0} / ${item.observation_errors || 0}</td><td><button class="link-button" data-playlist-run="${esc(item.run_id || "")}" ${busy || auto || !item.run_id ? "disabled" : ""}>回看</button></td></tr>`,
+          `<tr class="${(state.replay ? item.run_id === state.replay.run_id : !playlistSelection && index === playlist.index) ? "current" : ""}"><td>${item.round} / ${esc(item.name)}<small class="robot-playlist-case-status">${esc(labels[item.status] || item.status)}</small></td><td>${esc(labels[item.status] || item.status)}</td><td>${item.checks || 0} / ${item.reviews || 0} / ${item.observation_errors || 0}</td><td><button class="link-button" data-playlist-run="${esc(item.run_id || "")}" data-playlist-event="${Number.isInteger(item.event_index) ? item.event_index : ""}" ${busy || auto || !item.run_id ? "disabled" : ""}>回看</button></td></tr>`,
       )
       .join("");
     $("robot-playlist-rows")
@@ -412,12 +419,18 @@ window.OneJevRobot = (() => {
       .forEach((button) =>
         button.addEventListener("click", async () => {
           try {
+            const itemEvent =
+              button.dataset.playlistEvent === ""
+                ? null
+                : Number(button.dataset.playlistEvent);
             const report = await robotApi(
               `/api/robot/runs/${button.dataset.playlistRun}`,
             );
             await perform("replay", {
               source_id: report.id,
-              event_index: report.events.length - 1,
+              event_index: Number.isInteger(itemEvent)
+                ? itemEvent
+                : report.events.length - 1,
             });
           } catch (error) {
             toast(error.message);
@@ -492,11 +505,28 @@ window.OneJevRobot = (() => {
     }
   }
   async function refresh() {
-    if (active() && !working && initialized) {
+    if (active() && initialized) {
       const epoch = viewRevision;
+      const wasWorking = working;
       try {
         const next = await robotApi("/api/robot");
-        if (epoch === viewRevision && !working) accept(next);
+        if (epoch === viewRevision && wasWorking === working) {
+          if (working) {
+            // Keep action results/revisions owned by their POST response, while
+            // showing stage changes during a slow render or model request.
+            if (state?.id === next.id) {
+              for (const key of [
+                "activity",
+                "busy",
+                "retrying_observation",
+                "capture",
+                "clients",
+              ])
+                state[key] = next[key];
+              render();
+            }
+          } else accept(next);
+        }
       } catch (_) {
         if (epoch === viewRevision && !working) {
           online = false;

@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi import HTTPException
-from qev.robot import Kinematics, RobotWorld, RobotController, RobotControl, RobotPlayback, RobotDemo, RobotReplay, read_report
+from qev.robot import Kinematics, RobotWorld, RobotController, RobotControl, RobotPlayback, RobotDemo, RobotReplay, read_report, reconcile_playlists, process_owner
 
 HAS_ROBOT = all(importlib.util.find_spec(name) is not None for name in ("viser", "scipy", "numpy"))
 
@@ -33,6 +33,42 @@ class KinematicsTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             Kinematics().solve([20., 0., 0.], np.zeros(6))
+
+
+class PlaylistJournalTests(unittest.TestCase):
+    def test_only_abandoned_active_journals_are_marked_interrupted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for key, owner, status in (("a", {"pid": 999999999}, "running"),
+                                       ("b", process_owner(), "running"), ("c", {}, "completed")):
+                path = root / "playlists" / (key * 32) / "report.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({"id": key * 32, "owner": owner, "status": status, "index": 0,
+                    "items": [{"status": status}], "next_case_at": 123.}))
+            reconcile_playlists(root)
+            interrupted = read_report(root / "playlists", "a" * 32)
+            self.assertEqual(interrupted["status"], "interrupted")
+            self.assertEqual(interrupted["previous_status"], "running")
+            self.assertIsNone(interrupted["next_case_at"])
+            self.assertEqual(read_report(root / "playlists", "b" * 32)["status"], "running")
+            self.assertEqual(read_report(root / "playlists", "c" * 32)["status"], "completed")
+
+    def test_zombie_process_is_not_mistaken_for_an_active_playlist_owner(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "playlists" / ("d" * 32) / "report.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"id": "d" * 32, "owner": {"pid": 424242, "started": "123"},
+                "status": "running", "index": 0, "items": [{"status": "running"}]}))
+            original = Path.read_text
+            def read(file, *args, **kwargs):
+                if str(file) == "/proc/424242/stat":
+                    return "424242 (qev) " + " ".join(["Z"] + ["0"] * 18 + ["123"])
+                return original(file, *args, **kwargs)
+            with patch("qev.robot.os.kill"), patch.object(Path, "read_text", read):
+                reconcile_playlists(root)
+            self.assertEqual(read_report(root / "playlists", "d" * 32)["status"], "interrupted")
 
 
 @unittest.skipUnless(HAS_ROBOT, "install the robot optional dependencies")
@@ -505,6 +541,38 @@ class RobotSkillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.world.id, current["id"])
         self.controller.pause(RobotControl())
         await self.controller.auto_task
+
+    async def test_stopped_summary_and_replay_checkpoint_do_not_change_after_manual_actions(self):
+        await self.controller.demo(RobotDemo(sequence="all", judge=False, delay=15))
+        await self.wait_until(lambda: self.world.phase == "hover")
+        self.controller.stop(RobotControl())
+        await self.controller.auto_task
+        saved = copy.deepcopy(self.world.playlist)
+        checkpoint = saved["items"][0]["event_index"]
+        await self.controller.operate(lambda w: w.execute(), RobotControl())
+        self.assertEqual(self.world.phase, "grasped")
+        self.assertEqual(self.world.playlist, saved)
+        self.world.show_replay(self.world.snapshot(), event_index=checkpoint)
+        self.assertEqual(self.world.replay["pose"]["phase"], "hover")
+
+    async def test_stop_during_motion_records_the_settled_final_checkpoint(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        move = self.world.move
+        async def blocked_move(target, duration=1.2):
+            started.set()
+            await release.wait()
+            await move(target, duration)
+        self.world.move = blocked_move
+        await self.controller.demo(RobotDemo(sequence="all", judge=False))
+        await started.wait()
+        self.controller.stop(RobotControl())
+        release.set()
+        await self.controller.auto_task
+        item = self.world.playlist["items"][0]
+        self.assertEqual(item["status"], "stopped")
+        self.assertEqual(item["phase"], "hover")
+        self.assertEqual(item["event_index"], 1)
+        self.assertEqual(item["revision"], 1)
 
 
 if __name__ == "__main__":

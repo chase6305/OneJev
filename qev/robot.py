@@ -10,6 +10,7 @@ import base64
 import io
 import json
 import math
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,53 @@ def read_report(root: Path, identifier: str):
         return json.loads(report_path(root, identifier).read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         raise HTTPException(404, "找不到有效的机器人记录") from None
+
+
+def process_owner():
+    pid = os.getpid()
+    try:
+        started = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        started = None
+    return {"pid": pid, "started": started}
+
+
+def reconcile_playlists(root: Path):
+    """Mark abandoned journals accurately without restarting their execution."""
+    for path in (root / "playlists").glob("*/report.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("status") not in ("running", "paused"):
+                continue
+            owner = data.get("owner", {})
+            pid = int(owner.get("pid", -1))
+            alive = False
+            if pid > 0:
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                    if owner.get("started"):
+                        current = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                        alive = current[0] != "Z" and current[19] == owner["started"]
+                except PermissionError:
+                    # Permission denial proves a process exists; don't rewrite
+                    # a journal owned by another still-running service.
+                    alive = True
+                except (OSError, IndexError):
+                    alive = False
+            if alive:
+                continue
+            data["previous_status"], data["status"] = data["status"], "interrupted"
+            data["next_case_at"] = None
+            data["reason"] = "网站已重启，旧任务未恢复执行"
+            item = data["items"][data["index"]]
+            if item["status"] not in ("completed", "stopped"):
+                item["status"] = "interrupted"
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+            temporary.replace(path)
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            continue
 
 
 class Kinematics:
@@ -135,6 +183,8 @@ class RobotWorld:
         self.auto_running = False
         self.playlist = None
         self.viewer_cursor = 0
+        self.capture_client_id = None
+        self.capture = {"mode": "browser", "ready": False, "message": "使用页面相机"}
         self.delay, self.motion_speed = 3., 1.
         self.auto_judge = True
         self.pause_on_review = True
@@ -175,6 +225,7 @@ class RobotWorld:
         self.pending_observation, self.retrying_observation = False, False
         self.observation_errors: list[dict] = []
         self.last_capture = None
+        self.activity = None
         self.draw()
         self.record_event("reset", "初始场景", 0.)
         self.save()
@@ -209,7 +260,7 @@ class RobotWorld:
                 "next_skill": self.next_skill(), "busy": self.busy, "attached": self.attached,
                 "miss_next": self.miss_next, "truth": self.truth(), "revision": self.revision,
                 "judged_revision": self.judged_revision, "history": self.history, "error": self.error,
-                "clients": len(self.viewers()), "q": self.q.tolist(), "cube": self.cube.tolist(),
+                "clients": len([key for key in self.viewers() if key != self.capture_client_id]), "q": self.q.tolist(), "cube": self.cube.tolist(),
                 "tray": self.tray.tolist(), "gap": self.gap, "simulation": "kinematic",
                 "schema_version": 2, "created_at": self.created_at, "events": self.events,
                 "replay": self.replay, "auto_running": self.auto_running, "delay": self.delay,
@@ -218,6 +269,7 @@ class RobotWorld:
                 "playlist": self.playlist, "playlist_id": self.playlist["id"] if self.playlist else None,
                 "pending_observation": self.pending_observation, "retrying_observation": self.retrying_observation,
                 "observation_errors": self.observation_errors,
+                "capture": self.capture, "activity": self.activity,
                 "next_step_at": self.next_step_at, "pause_reason": self.pause_reason,
                 "next_action": self.next_action(), "scenario": {"key": self.scenario,
                     **SCENARIOS[self.scenario], "fault_done": self.scenario_fault_done}}
@@ -231,6 +283,9 @@ class RobotWorld:
             except AssertionError:
                 continue
         return ready
+
+    def set_activity(self, kind, label):
+        self.activity = {"kind": kind, "label": label, "started_at": time.time()} if kind else None
 
     def save(self):
         payload = self.snapshot()
@@ -335,6 +390,7 @@ class RobotWorld:
             raise HTTPException(409, "动作已结束，可以重置场景再看一次")
         self.revision += 1
         self.pending_observation = False
+        self.set_activity("motion", SKILLS[skill])
         if skill == "approach":
             await self.move([*self.cube[:2], self.cube[2] + .20])
             self.phase = "hover"
@@ -397,11 +453,13 @@ class RobotWorld:
             self.scenario_fault_done = True
         self.record_event("fault", FAULTS[kind], time.perf_counter() - started)
 
-    async def observe(self, client):
+    async def observe(self, client, viewer=None):
         from PIL import Image
         from scipy.spatial.transform import Rotation
 
         self.last_capture = None
+        self.set_activity("capture", "固定相机截图")
+        captured_at = time.perf_counter()
         clients = self.viewers()
         if not clients:
             raise HTTPException(409, "请等待三维视图连接，再进行视觉判断")
@@ -414,7 +472,7 @@ class RobotWorld:
         rotation = self.np.stack([x, self.np.cross(z, x), z], axis=1)
         quaternion = Rotation.from_matrix(rotation).as_quat()[[3, 0, 1, 2]]
         self.server.flush()
-        viewer = list(clients.values())[self.viewer_cursor % len(clients)]
+        viewer = viewer or list(clients.values())[self.viewer_cursor % len(clients)]
         self.viewer_cursor += 1
         frame = await asyncio.to_thread(viewer.get_render, height=720, width=960, position=position,
                                         wxyz=quaternion, fov=.76, transport_format="jpeg", timeout=15)
@@ -424,6 +482,8 @@ class RobotWorld:
         self.capture_count += 1
         (self.path / filename).write_bytes(stream.getvalue())
         self.last_capture = f"/api/robot/runs/{self.id}/{filename}"
+        capture_s = time.perf_counter() - captured_at
+        self.set_activity("inference", "模型视觉判断")
         started = time.perf_counter()
         response = await asyncio.to_thread(
             client.system_one, {"task": "Put the red cube into the blue tray and release it.", "camera": "<image:1>"},
@@ -439,6 +499,7 @@ class RobotWorld:
                   "image": f"/api/robot/runs/{self.id}/{filename}", "answers": answers,
                   "truth": self.truth(), "model": response.model, "meta": response.meta,
                   "usage": response.usage, "request_s": time.perf_counter() - started,
+                  "capture_s": capture_s, "observation_s": time.perf_counter() - captured_at,
                   "q": self.q.tolist(), "cube": self.cube.tolist(), "tray": self.tray.tolist(),
                   "pose": self.pose(), "at": datetime.now(timezone.utc).isoformat()}
         self.history.append(record)
@@ -490,10 +551,13 @@ class RobotReplay(RobotControl):
 class RobotController:
     """One executor per shared scene, independent of browser tabs and their timers."""
 
-    def __init__(self, live, backend):
+    def __init__(self, live, backend, capture=None):
         self.live, self.backend = live, backend
+        self.capture = capture
         self.auto_task = None
         self.wake = asyncio.Event()
+        self.finalizing_playlist = None
+        reconcile_playlists(live.root)
 
     def save_playlist(self):
         playlist = self.live.playlist
@@ -509,10 +573,15 @@ class RobotController:
         live = self.live
         playlist = live.playlist
         if playlist:
+            if playlist["status"] in ("completed", "stopped", "interrupted") and self.finalizing_playlist != playlist["id"]:
+                return
             item = playlist["items"][playlist["index"]]
             item.update(run_id=live.id, phase=live.phase, steps=max(0, len(live.events) - 1),
                         checks=len(live.history), reviews=sum(agreement(r) != "判断与场景一致" for r in live.history),
                         observation_errors=len(live.observation_errors), truth=live.truth(), error=live.error)
+            if item["status"] in ("completed", "stopped"):
+                item.update(event_index=len(live.events) - 1, revision=live.revision,
+                            finished_at=datetime.now(timezone.utc).isoformat())
             self.save_playlist()
 
     def has_next_case(self):
@@ -529,7 +598,11 @@ class RobotController:
             try:
                 if self.backend.state != "ready":
                     raise ConnectionError("模型尚未就绪")
-                await live.observe(self.backend.client)
+                if self.capture:
+                    viewer = await self.capture.get_viewer()
+                    await live.observe(self.backend.client, viewer=viewer)
+                else:
+                    await live.observe(self.backend.client)
                 live.pending_observation = live.retrying_observation = False
                 live.error = None
                 if was_pending and not live.auto_running:
@@ -541,9 +614,12 @@ class RobotController:
                 live.observation_errors.append({"revision": live.revision, "attempt": attempt,
                     "at": datetime.now(timezone.utc).isoformat(), "message": message, "image": live.last_capture})
                 transient = exc.code in (429, 502, 503, 504) if isinstance(exc, HTTPError) else isinstance(exc, (URLError, OSError, TimeoutError))
+                if transient and self.capture and live.activity and live.activity["kind"] in ("capture", "capture_start"):
+                    await self.capture.invalidate()
                 if not automatic or attempt == 2 or not transient or not live.auto_running:
                     break
                 live.retrying_observation = True
+                live.set_activity("retry", "等待重试视觉检查")
                 live.save()
                 self.wake.clear()
                 try:
@@ -582,6 +658,7 @@ class RobotController:
                     await self.check_observation(from_auto)
             finally:
                 live.busy = False
+                live.set_activity(None, None)
                 self.update_item()
                 live.save()
         return live.snapshot()
@@ -636,6 +713,7 @@ class RobotController:
         live.reset(items[0]["scenario"])
         if len(items) > 1:
             live.playlist = {"id": uuid4().hex, "created_at": datetime.now(timezone.utc).isoformat(),
+                "owner": process_owner(),
                 "status": "running", "sequence": options.sequence, "rounds": options.rounds,
                 "case_delay": options.case_delay, "index": 0, "next_case_at": None, "items": items}
             items[0].update(run_id=live.id, status="running")
@@ -665,10 +743,14 @@ class RobotController:
             item = playlist["items"][playlist["index"]]
             if item["status"] != "completed":
                 item["status"] = status
+            item.update(event_index=len(self.live.events) - 1, revision=self.live.revision,
+                        finished_at=datetime.now(timezone.utc).isoformat())
             self.save_playlist()
 
     def stop(self, options):
         self.validate(options, revision=False)
+        if self.live.playlist and self.live.playlist["status"] in ("running", "paused") and self.auto_task and not self.auto_task.done():
+            self.finalizing_playlist = self.live.playlist["id"]
         self.pause(options)
         self.finish_playlist("stopped")
         self.live.pause_reason = "连播已结束，当前动作完成后停留" if self.live.busy else "连播已结束，当前场景已保留"
@@ -721,7 +803,7 @@ class RobotController:
                         return None
                     await self.operate(noop, RobotControl(), judge=True, from_auto=True)
                 elif not live.next_action():
-                    if live.playlist:
+                    if live.playlist and live.playlist["status"] in ("running", "paused"):
                         live.playlist["items"][live.playlist["index"]]["status"] = "completed"
                         self.update_item()
                     if not self.has_next_case():
@@ -762,6 +844,7 @@ class RobotController:
                 if item["status"] != "completed":
                     item["status"] = "paused"
             self.update_item()
+            self.finalizing_playlist = None
             live.save()
 
     async def replay(self, options):
@@ -785,6 +868,8 @@ class RobotController:
         self.wake.set()
         if self.auto_task:
             await self.auto_task
+        if self.capture:
+            await self.capture.close()
         await asyncio.to_thread(self.live.close)
 
 
@@ -798,7 +883,9 @@ def install_routes(app, studio):
             if holder["world"] is None:
                 try:
                     holder["world"] = await asyncio.to_thread(RobotWorld, studio.config.output)
-                    holder["controller"] = RobotController(holder["world"], studio.backend)
+                    from .robot_capture import ManagedCapture
+                    capture = ManagedCapture(holder["world"], studio.config.channel)
+                    holder["controller"] = RobotController(holder["world"], studio.backend, capture)
                 except ImportError as exc:
                     raise HTTPException(503, "请先安装机器人展示支持：pip install -e '.[robot]'") from exc
             return holder["world"]

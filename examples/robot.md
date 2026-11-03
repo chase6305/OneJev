@@ -12,6 +12,9 @@ pip install -e '.[browser,robot]'
 qev studio
 ```
 
+已安装的 Chrome 会自动识别。如果服务器没有 Chrome，可先运行
+`python -m playwright install chromium` 安装内置相机使用的浏览器。
+
 Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页面与 WebSocket
 都通过网站同一个地址提供；SSH 转发时只需要转发网站端口，不需要单独开放 Viser 端口。
 
@@ -37,8 +40,16 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 如果不希望自动继续，可先暂停并勾选“需要复核时暂停”，再用工具栏的“自动演示”从当前
 动作继续。执行错误或持续的视觉请求失败仍会暂停；暂停按钮始终可用。
 
-模型检查需要保留至少一个已连接的浏览器三维视图。全自动指演示流程自动运行，
-动作仍由预设技能与逆运动学执行，当前版本不包含模型自主规划或真机控制。
+Studio 会在第一次视觉检查时启动并管理内置相机渲染。它不依赖交互页面的自由视角，
+可以切到其他页面或关闭交互浏览器，让服务端继续连播和模型检查。
+相机下方会显示“内置相机已就绪，可关闭交互页面”。
+
+如果内置浏览器无法启动，会尝试使用已连接的页面相机，并明确显示
+“使用页面相机，请保持三维页面打开”；此时应保留页面。没有可用相机时会暂停并保留
+现场，不会伪造图像。内置相机进程断开后，下次检查会重建连接，关闭 Studio 时会一并清理。
+
+全自动指演示流程自动运行，动作仍由预设技能与逆运动学执行，当前版本不包含模型
+自主规划或真机控制。
 
 三维视图中的原生设置面板默认收起，可点击“视图设置”显示或隐藏。“复位视角”只恢复
 本标签页的相机视角，“重连视图”只重新连接三维页面，两者都不会重置机械臂或推进动作。
@@ -61,8 +72,8 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 
 网站连接中断时，会显示提示并暂时禁用场景操作，恢复连接后重新同步同一条记录。
 服务端的自动演示可能仍在继续，不会因为浏览器暂时断线而重复开始。
-如需暂停，恢复连接后点击“暂停演示”。只有一份浏览器三维视图时，关闭该视图会使
-后续相机检查无法完成，自动演示会按原有错误处理暂停。
+如需暂停，恢复连接后点击“暂停演示”。内置相机就绪时，关闭交互页面不影响相机检查；
+若正在使用页面相机回退模式，则仍需保留页面。
 
 ## 连播与结果汇总
 
@@ -78,7 +89,9 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 暂停或结束后，可点击“回看”查看某一例的三维记录，也可导出汇总 JSON。
 下拉框可选择最近 100 条历史连播记录。报告保存在
 `runs/studio/robot/playlists/<连播 ID>/report.json`，各案例的独立报告通过 `playlist_id`
-关联。网站重启后可回看历史，但不会自动恢复旧任务的执行。
+关联。网站重启后可回看历史，但不会自动恢复旧任务的执行。未完成的旧任务会标为
+“已中断”，同时保留重启前的状态。完成或结束的汇总固定在该次执行的记录点，
+后续手动操作不会改写汇总，回看也会显示结束时的姿态。
 
 ## 视觉请求失败后的恢复
 
@@ -168,8 +181,10 @@ Select a preset and click the one-click full demo to start a fresh run with no
 per-step confirmations. Actions, scheduled faults, recovery and enabled visual checks
 run automatically; uncertain/disagreeing predictions are recorded without pausing.
 Pause and enable pause-on-review for supervised playback from the current state. Execution,
-camera and persistent inference errors still stop playback, and visual checks require a connected
-browser viewer. This automates the demonstration, not model-driven motion planning.
+camera and persistent inference errors still stop playback. A managed private viewer renders
+observations even after the interactive page closes, rebuilding its connection or browser
+when needed. If it cannot launch, an existing interactive viewer is used with an explicit
+keep-open message. This automates the demonstration, not model-driven motion planning.
 
 Select the current case or all four presets, choose 1–20 rounds, and start a playlist.
 Cases have independent reports and a shared summary with replay links and JSON export.
