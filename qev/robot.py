@@ -9,20 +9,50 @@ import asyncio
 import base64
 import io
 import json
+import math
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .browser import probability
 from .client import Choice, Noul
 
 PHASES = {"ready": "等待开始", "hover": "已靠近物体", "grasped": "夹爪已闭合", "lifted": "已抬起", "dropped": "物体掉落", "placed": "已放置", "complete": "动作结束"}
 SKILLS = {"approach": "靠近方块", "grasp": "闭合夹爪", "lift": "抬起方块", "place": "放入托盘", "recover": "重新抓取", "retreat": "收回机械臂"}
+FAULTS = {"miss": "设置抓空", "drop": "方块掉落", "shift": "移动托盘"}
+
+
+def agreement(record):
+    """Keep uncertainty distinct from disagreement; never adjust model scores."""
+    if not record:
+        return "等待观察"
+    uncertain = False
+    for key in ("placed", "grasped"):
+        p = record["answers"][key]["noul"]
+        if .15 < p < .85:
+            uncertain = True
+        elif (p >= .85) != record["truth"][key]:
+            return "需要复核"
+    return "模型不确定" if uncertain else "判断与场景一致"
+
+
+def report_path(root: Path, identifier: str):
+    if len(identifier) != 32 or any(ch not in "0123456789abcdef" for ch in identifier):
+        raise HTTPException(404, "找不到机器人记录")
+    return root / identifier / "report.json"
+
+
+def read_report(root: Path, identifier: str):
+    try:
+        return json.loads(report_path(root, identifier).read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        raise HTTPException(404, "找不到有效的机器人记录") from None
 
 
 class Kinematics:
@@ -95,6 +125,16 @@ class RobotWorld:
             self.server.scene.add_box(f"/tray/wall{i}", dimensions=dimensions, position=position, color=(48, 98, 189))
         self.lock = asyncio.Lock()
         self.busy = False
+        self.auto_running = False
+        self.delay, self.motion_speed = 3., 1.
+        self.auto_judge = True
+        try:
+            preferences = RobotPlayback.model_validate(json.loads((self.root / "settings.json").read_text(encoding="utf-8")))
+            self.delay, self.motion_speed, self.auto_judge = preferences.delay, preferences.motion_speed, preferences.judge
+        except (OSError, ValueError, TypeError):
+            pass
+        self.next_step_at = None
+        self.pause_reason = None
         self.reset()
 
     def reset(self):
@@ -102,6 +142,7 @@ class RobotWorld:
         self.id = uuid4().hex
         self.path = self.root / self.id
         self.path.mkdir()
+        self.created_at = datetime.now(timezone.utc).isoformat()
         self.phase = "ready"
         self.cube = np.array([.08, -.18, .0375])
         self.tray = np.array([-.02, .23, 0.])
@@ -109,9 +150,14 @@ class RobotWorld:
         self.attached, self.miss_next = False, False
         self.gap = .13
         self.history: list[dict] = []
+        self.events: list[dict] = []
+        self.replay = None
+        self.capture_count = 0
         self.revision, self.judged_revision = 0, -1
         self.error = None
+        self.pause_reason = None
         self.draw()
+        self.record_event("reset", "初始场景", 0.)
         self.save()
 
     def truth(self) -> dict:
@@ -129,7 +175,11 @@ class RobotWorld:
                 "miss_next": self.miss_next, "truth": self.truth(), "revision": self.revision,
                 "judged_revision": self.judged_revision, "history": self.history, "error": self.error,
                 "clients": len(self.viewers()), "q": self.q.tolist(), "cube": self.cube.tolist(),
-                "tray": self.tray.tolist(), "simulation": "kinematic"}
+                "tray": self.tray.tolist(), "gap": self.gap, "simulation": "kinematic",
+                "schema_version": 2, "created_at": self.created_at, "events": self.events,
+                "replay": self.replay, "auto_running": self.auto_running, "delay": self.delay,
+                "motion_speed": self.motion_speed, "auto_judge": self.auto_judge,
+                "next_step_at": self.next_step_at, "pause_reason": self.pause_reason}
 
     def viewers(self):
         ready = {}
@@ -142,13 +192,58 @@ class RobotWorld:
         return ready
 
     def save(self):
-        (self.path / "report.json").write_text(json.dumps(self.snapshot(), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        payload = self.snapshot()
+        # A report describes its own live run, never another run's replay selection.
+        payload["replay"] = None
+        temporary = self.path / "report.tmp"
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        temporary.replace(self.path / "report.json")
 
-    def draw(self):
+    def save_settings(self):
+        temporary = self.root / "settings.tmp"
+        temporary.write_text(json.dumps({"delay": self.delay, "motion_speed": self.motion_speed,
+                                         "judge": self.auto_judge}), encoding="utf-8")
+        temporary.replace(self.root / "settings.json")
+
+    def pose(self):
+        return {"q": self.q.tolist(), "cube": self.cube.tolist(), "tray": self.tray.tolist(),
+                "gap": self.gap, "attached": self.attached, "phase": self.phase}
+
+    def record_event(self, kind, label, duration):
+        self.events.append({"index": len(self.events), "kind": kind, "label": label,
+                            "at": datetime.now(timezone.utc).isoformat(), "duration_s": duration,
+                            "revision": self.revision, "pose": self.pose(), "truth": self.truth()})
+
+    def show_replay(self, report, *, event_index=None, history_index=None):
+        try:
+            if event_index is not None:
+                if event_index < 0:
+                    raise IndexError
+                event = report["events"][event_index]
+                pose, truth, label = event["pose"], event["truth"], event["label"]
+                record = next((r for r in reversed(report["history"]) if r["revision"] == event["revision"]), None)
+            else:
+                if history_index is None or history_index < 0:
+                    raise IndexError
+                record = report["history"][history_index]
+                # Older reports have no gripper gap. They remain viewable as images only.
+                pose, truth, label = record["pose"], record["truth"], f"第 {history_index + 1} 次视觉检查"
+            for key, length, bound in (("q", 6, math.pi + .01), ("cube", 3, 2), ("tray", 3, 2)):
+                if len(pose[key]) != length or any(not math.isfinite(v) or abs(v) > bound for v in pose[key]):
+                    raise ValueError
+            if not math.isfinite(pose["gap"]) or not 0 <= pose["gap"] <= .2:
+                raise ValueError
+        except (IndexError, KeyError, TypeError, ValueError):
+            raise HTTPException(422, "该记录缺少有效的三维姿态，无法回放") from None
+        self.replay = {"run_id": report["id"], "event_index": event_index, "history_index": history_index,
+                       "label": label, "pose": pose, "truth": truth, "record": record}
+        self.draw(pose)
+
+    def draw(self, pose=None):
         from scipy.spatial.transform import Rotation
 
         np = self.np
-        points, rotation = self.kinematics.forward(self.q)
+        points, rotation = self.kinematics.forward(self.q if pose is None else pose["q"])
         with self.server.atomic():
             for index, (start, end) in enumerate(zip(points[:-1], points[1:])):
                 self.joints[index].position = start
@@ -164,13 +259,15 @@ class RobotWorld:
             quaternion = Rotation.from_matrix(rotation).as_quat()
             self.tool.position, self.tool.wxyz = points[-1], quaternion[[3, 0, 1, 2]]
             for index, finger in enumerate(self.fingers):
-                finger.position = ((-1 if index == 0 else 1) * (self.gap + .018) / 2, 0, -.065)
-            if self.attached:
+                gap = self.gap if pose is None else pose["gap"]
+                finger.position = ((-1 if index == 0 else 1) * (gap + .018) / 2, 0, -.065)
+            if pose is None and self.attached:
                 self.cube = points[-1] + rotation @ np.array([0., 0., -.0875])
-            self.cube_node.position = self.cube
-            self.tray_node.position = self.tray
+            self.cube_node.position = self.cube if pose is None else np.array(pose["cube"])
+            self.tray_node.position = self.tray if pose is None else np.array(pose["tray"])
 
     async def move(self, target, duration=1.2):
+        duration /= self.motion_speed
         goal = self.kinematics.solve(target, self.q)
         start = self.q.copy()
         frames = max(2, round(duration * 30))
@@ -183,12 +280,14 @@ class RobotWorld:
 
     async def grip(self, closed: bool):
         start, goal = self.gap, .076 if closed else .13
+        frame_time = .025 / self.motion_speed
         for i in range(1, 13):
             self.gap = start + (goal - start) * i / 12
             self.draw()
-            await asyncio.sleep(.025)
+            await asyncio.sleep(frame_time)
 
     async def execute(self):
+        started = time.perf_counter()
         skill = self.next_skill()
         if skill is None:
             raise HTTPException(409, "动作已结束，可以重置场景再看一次")
@@ -225,9 +324,11 @@ class RobotWorld:
             await self.move([*self.tray[:2], .38])
             self.phase = "complete"
         self.draw()
+        self.record_event("skill", SKILLS[skill], time.perf_counter() - started)
         return skill
 
     async def inject(self, kind: str):
+        started = time.perf_counter()
         if kind == "miss":
             if self.attached or self.phase not in ("ready", "hover"):
                 raise HTTPException(409, "请在抓取前注入抓空故障")
@@ -248,6 +349,7 @@ class RobotWorld:
             self.tray[0] = -.17 if self.tray[0] > -.10 else -.02
         self.revision += 1
         self.draw()
+        self.record_event("fault", FAULTS[kind], time.perf_counter() - started)
 
     async def observe(self, client):
         from PIL import Image
@@ -270,7 +372,8 @@ class RobotWorld:
                                         wxyz=quaternion, fov=.76, transport_format="jpeg", timeout=15)
         stream = io.BytesIO()
         Image.fromarray(frame).save(stream, format="PNG")
-        filename = f"{len(self.history):04d}.png"
+        filename = f"{self.capture_count:04d}.png"
+        self.capture_count += 1
         (self.path / filename).write_bytes(stream.getvalue())
         started = time.perf_counter()
         response = await asyncio.to_thread(
@@ -287,7 +390,8 @@ class RobotWorld:
                   "image": f"/api/robot/runs/{self.id}/{filename}", "answers": answers,
                   "truth": self.truth(), "model": response.model, "meta": response.meta,
                   "usage": response.usage, "request_s": time.perf_counter() - started,
-                  "q": self.q.tolist(), "cube": self.cube.tolist(), "tray": self.tray.tolist()}
+                  "q": self.q.tolist(), "cube": self.cube.tolist(), "tray": self.tray.tolist(),
+                  "pose": self.pose(), "at": datetime.now(timezone.utc).isoformat()}
         self.history.append(record)
         self.judged_revision = self.revision
         return record
@@ -296,17 +400,170 @@ class RobotWorld:
         self.server.stop()
 
 
-class RobotAction(BaseModel):
+class RobotControl(BaseModel):
+    run_id: str | None = None
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class RobotAction(RobotControl):
     judge: bool = True
 
 
-class RobotFault(BaseModel):
+class RobotFault(RobotControl):
     kind: Literal["miss", "drop", "shift"]
+
+
+class RobotPlayback(RobotAction):
+    delay: float = Field(default=3, ge=.5, le=15, allow_inf_nan=False)
+    motion_speed: float = Field(default=1, ge=.25, le=2, allow_inf_nan=False)
+
+
+class RobotReplay(RobotControl):
+    source_id: str
+    event_index: int | None = Field(default=None, ge=0)
+    history_index: int | None = Field(default=None, ge=0)
+
+
+class RobotController:
+    """One executor per shared scene, independent of browser tabs and their timers."""
+
+    def __init__(self, live, backend):
+        self.live, self.backend = live, backend
+        self.auto_task = None
+        self.wake = asyncio.Event()
+
+    def validate(self, options, *, revision=True):
+        if options.run_id is not None and options.run_id != self.live.id:
+            raise HTTPException(409, "场景已被重置，请查看最新状态后再操作")
+        if revision and options.expected_revision is not None and options.expected_revision != self.live.revision:
+            raise HTTPException(409, "其他页面已推进场景，请查看最新状态后再操作")
+
+    async def operate(self, action, options, *, judge=False, from_auto=False, replay_ok=False):
+        live = self.live
+        if live.lock.locked():
+            raise HTTPException(409, "机械臂正在执行，请稍候")
+        async with live.lock:
+            self.validate(options)
+            if live.auto_running and not from_auto:
+                raise HTTPException(409, "请先暂停自动演示，再操作场景")
+            if live.replay and not replay_ok:
+                raise HTTPException(409, "当前为历史回放，请先返回当前场景")
+            live.busy, live.error = True, None
+            try:
+                await action(live)
+                if judge:
+                    if self.backend.state == "ready":
+                        try:
+                            await live.observe(self.backend.client)
+                        except Exception as exc:
+                            live.error = f"动作状态已保留，视觉判断暂未完成：{getattr(exc, 'detail', str(exc))}"
+                    else:
+                        live.error = "模型尚未就绪，动作状态已保留，可稍后点击视觉判断"
+            finally:
+                live.busy = False
+                live.save()
+        return live.snapshot()
+
+    async def start(self, options):
+        live = self.live
+        self.validate(options)
+        if live.auto_running:
+            return live.snapshot()  # A second tab attaches to the existing playback.
+        if live.lock.locked() or (self.auto_task and not self.auto_task.done()):
+            raise HTTPException(409, "当前动作正在结束，请稍候")
+        if live.replay:
+            raise HTTPException(409, "请先返回当前场景，再开始演示")
+        if not live.next_skill():
+            raise HTTPException(409, "动作已结束，请重置场景")
+        if options.judge and self.backend.state != "ready":
+            raise HTTPException(409, "请等待模型就绪，或关闭动作后自动判断")
+        live.delay, live.motion_speed = options.delay, options.motion_speed
+        live.auto_judge = options.judge
+        live.save_settings()
+        live.auto_running, live.pause_reason = True, None
+        self.wake.clear()
+        self.auto_task = asyncio.create_task(self.autoplay())
+        live.save()
+        return live.snapshot()
+
+    def pause(self, options):
+        self.validate(options, revision=False)
+        self.live.auto_running = False
+        self.live.next_step_at = None
+        self.live.pause_reason = "已暂停，当前动作完成后停留" if self.live.busy else "已暂停"
+        self.wake.set()
+        self.live.save()
+        return self.live.snapshot()
+
+    def settings(self, options):
+        self.validate(options, revision=False)
+        self.live.delay, self.live.motion_speed = options.delay, options.motion_speed
+        if not self.live.auto_running:
+            self.live.auto_judge = options.judge
+        self.live.save_settings()
+        self.wake.set()
+        self.live.save()
+        return self.live.snapshot()
+
+    async def autoplay(self):
+        live = self.live
+        try:
+            while live.auto_running and live.next_skill():
+                await self.operate(lambda w: w.execute(), RobotControl(), judge=live.auto_judge, from_auto=True)
+                if live.error:
+                    live.pause_reason = "视觉请求未完成，演示已暂停"
+                    break
+                if live.auto_judge and agreement(live.history[-1] if live.history else None) != "判断与场景一致":
+                    live.pause_reason = "模型判断需要复核，演示已暂停；可检查画面或手动执行"
+                    break
+                if not live.next_skill():
+                    live.pause_reason = "动作已完成"
+                    break
+                completed = time.monotonic()
+                while live.auto_running:
+                    remaining = completed + live.delay - time.monotonic()
+                    live.next_step_at = time.time() + max(0, remaining)
+                    if remaining <= 0:
+                        break
+                    self.wake.clear()
+                    try:
+                        await asyncio.wait_for(self.wake.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
+        except Exception as exc:
+            live.error = f"演示暂停：{getattr(exc, 'detail', str(exc))}"
+            live.pause_reason = "执行未完成，请检查当前场景"
+        finally:
+            live.auto_running, live.next_step_at = False, None
+            live.save()
+
+    async def replay(self, options):
+        if (options.event_index is None) == (options.history_index is None):
+            raise HTTPException(422, "请选择一条动作或视觉检查记录")
+        report = self.live.snapshot() if options.source_id == self.live.id else read_report(self.live.root, options.source_id)
+
+        async def action(live):
+            live.show_replay(report, event_index=options.event_index, history_index=options.history_index)
+
+        return await self.operate(action, options, replay_ok=True)
+
+    async def resume_live(self, options):
+        async def action(live):
+            live.replay = None
+            live.draw()
+        return await self.operate(action, options, replay_ok=True)
+
+    async def close(self):
+        self.live.auto_running = False
+        self.wake.set()
+        if self.auto_task:
+            await self.auto_task
+        await asyncio.to_thread(self.live.close)
 
 
 def install_routes(app, studio):
     """Lazy optional integration; base Studio does not import robotics dependencies."""
-    holder = {"world": None}
+    holder = {"world": None, "controller": None}
     start_lock = asyncio.Lock()
 
     async def world():
@@ -314,13 +571,14 @@ def install_routes(app, studio):
             if holder["world"] is None:
                 try:
                     holder["world"] = await asyncio.to_thread(RobotWorld, studio.config.output)
+                    holder["controller"] = RobotController(holder["world"], studio.backend)
                 except ImportError as exc:
                     raise HTTPException(503, "请先安装机器人展示支持：pip install -e '.[robot]'") from exc
             return holder["world"]
 
     async def close():
         if holder["world"] is not None:
-            await asyncio.to_thread(holder["world"].close)
+            await holder["controller"].close()
 
     studio.close_robot = close
 
@@ -370,52 +628,75 @@ def install_routes(app, studio):
         except (WebSocketDisconnect, OSError):
             return
 
-    async def operate(action, *, judge=False):
-        live = await world()
-        if live.lock.locked():
-            raise HTTPException(409, "机械臂正在执行，请稍候")
-        async with live.lock:
-            live.busy, live.error = True, None
-            try:
-                await action(live)
-                if judge:
-                    if studio.backend.state == "ready":
-                        try:
-                            await live.observe(studio.backend.client)
-                        except Exception as exc:
-                            live.error = f"动作状态已保留，视觉判断暂未完成：{getattr(exc, 'detail', str(exc))}"
-                    else:
-                        live.error = "模型尚未就绪，动作状态已保留，可稍后点击视觉判断"
-            finally:
-                live.busy = False
-                live.save()
-        return live.snapshot()
+    async def controller():
+        await world()
+        return holder["controller"]
 
     @app.post("/api/robot/step")
     async def step(options: RobotAction):
-        return await operate(lambda live: live.execute(), judge=options.judge)
+        return await (await controller()).operate(lambda live: live.execute(), options, judge=options.judge)
 
     @app.post("/api/robot/observe")
-    async def observe():
+    async def observe(options: RobotControl = RobotControl()):
         async def noop(live):
             return None
-        return await operate(noop, judge=True)
+        return await (await controller()).operate(noop, options, judge=True)
 
     @app.post("/api/robot/reset")
-    async def reset():
+    async def reset(options: RobotControl = RobotControl()):
         async def action(live):
             live.reset()
-        return await operate(action)
+        return await (await controller()).operate(action, options)
 
     @app.post("/api/robot/fault")
     async def fault(options: RobotFault):
-        return await operate(lambda live: live.inject(options.kind))
+        return await (await controller()).operate(lambda live: live.inject(options.kind), options)
+
+    @app.post("/api/robot/auto")
+    async def auto(options: RobotPlayback):
+        return await (await controller()).start(options)
+
+    @app.post("/api/robot/pause")
+    async def pause(options: RobotControl):
+        return (await controller()).pause(options)
+
+    @app.post("/api/robot/settings")
+    async def settings(options: RobotPlayback):
+        return (await controller()).settings(options)
+
+    @app.post("/api/robot/replay")
+    async def replay(options: RobotReplay):
+        return await (await controller()).replay(options)
+
+    @app.post("/api/robot/live")
+    async def resume_live(options: RobotControl):
+        return await (await controller()).resume_live(options)
+
+    @app.get("/api/robot/runs")
+    async def runs():
+        live = await world()
+        reports = []
+        for path in sorted(live.root.glob("*/report.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                report = read_report(live.root, path.parent.name)
+                reports.append({"id": report["id"], "created_at": report.get("created_at"),
+                                "phase_label": report["phase_label"], "events": len(report.get("events", [])),
+                                "checks": len(report.get("history", []))})
+            except (HTTPException, KeyError, TypeError):
+                continue
+            if len(reports) >= 100:
+                break
+        return {"runs": reports}
+
+    @app.get("/api/robot/runs/{identifier}")
+    async def report(identifier: str):
+        live = await world()
+        return live.snapshot() if identifier == live.id else read_report(live.root, identifier)
 
     @app.get("/api/robot/runs/{identifier}/{name}")
     async def image(identifier: str, name: str):
-        if len(identifier) != 32 or any(ch not in "0123456789abcdef" for ch in identifier):
-            raise HTTPException(404)
-        if len(name) != 8 or not name[:4].isdigit() or name[4:] != ".png":
+        report_path(studio.config.output / "robot", identifier)
+        if len(name) < 8 or not name[:-4].isdigit() or name[-4:] != ".png":
             raise HTTPException(404)
         path = studio.config.output / "robot" / identifier / name
         if not path.is_file():

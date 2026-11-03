@@ -24,9 +24,15 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 逆运动学计算目标关节位置，动作以平滑关节插值展示。开启“动作后自动判断”时，
 每个技能结束后会请求固定相机渲染，并调用已有 OneJev 服务。
 
-“让模型看一眼”只进行视觉判断，不执行任何动作。“自动演示”在每个技能之间
-停留 3 秒；暂停会在当前技能结束后生效。如果判断不确定、与场景验收冲突，或
-模型请求失败，自动演示会暂停。仍可手动检查画面和执行技能。
+“让模型看一眼”只进行视觉判断，不执行任何动作。“自动演示”默认在每个技能之间
+停留 3 秒，可用滑块调整为 0.5–15 秒，动作速度可选 0.25–2 倍。暂停会在当前技能
+结束后生效。如果判断不确定、与场景验收冲突，或模型请求失败，自动演示会暂停。
+仍可手动检查画面和执行技能。若只想连续看完整动作，可先关闭“动作后自动判断”。
+
+自动演示由服务端统一推进。刷新页面、切换网站标签或关闭浏览器标签不会另开一轮演示，
+重新进入会显示当前进度；要停止后续动作，请点击“暂停演示”。同一 Studio 的多个页面
+共享播放、调速、故障和回放状态；过期页面的动作请求会被拒绝并刷新状态。
+速度、停留时间和自动判断选项会保存在本地，重启网站后继续使用，但不会自动恢复执行。
 
 ## 故障与恢复
 
@@ -55,9 +61,25 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 没有模拟接触力、摩擦、碰撞或真实抓取稳定性。动作由预设技能执行，OneJev 作为视觉检查器，
 当前版本没有将模型输出直接转换成机器人控制指令。
 
-视觉检查截图、原始输出、独立验收和关节/物体状态保存在
-`runs/studio/robot/<运行 ID>/`。页面缩略图用于回看相机记录，三维视图仍显示当前场景。
-该版本的机器人场景在同一 Studio 的多个标签页之间共享。
+## 三维回放与历史记录
+
+每个已完成动作和故障都会记录姿态，即使没有调用模型。暂停后，点击“动作与故障轨迹”
+卡片，三维视图会显示那一刻的机械臂、夹爪、方块和托盘。点击视觉检查缩略图，还能
+同时回看当时发送的相机画面、模型概率和独立场景验收。
+
+历史回放只显示记录，不推进当前状态，也不发起模型请求。回放期间执行、故障、重置和
+视觉判断按钮会禁用；点击“返回当前场景”后，从原来的动作继续。
+回放选择会同步到同一 Studio 的其他标签页。
+
+“当前演示”下拉框可选择之前的记录，包括重置或网站重启前保存的记录；列表显示最近
+100 次演示。旧版仅含相机截图的记录可导出 JSON，但不能回放缺失的三维姿态。
+“导出 JSON”下载所选演示的完整报告。
+
+动作/故障轨迹、视觉截图、原始输出、独立验收和姿态保存在
+`runs/studio/robot/<运行 ID>/`。`report.json` 使用原子替换保存，`schema_version: 2`
+的 `events` 保存每次动作结束的姿态，`history` 保存视觉检查。
+三维回放展示的是这些记录点，并非逐帧动作录像。网站重启会创建新场景，不会自动执行
+旧动作；可从历史下拉框回看已保存的场景。
 
 ## 验证
 
@@ -66,7 +88,8 @@ QEV_BROWSER_TESTS=1 QEV_BROWSER_CHANNEL=chrome python -m unittest discover -s te
 ```
 
 机器人检查覆盖可达性、完整抓放、抓空后恢复、掉落后恢复、目标移动、无效故障，
-以及真实浏览器中的同源 WebSocket 和相机请求。测试用的模型响应是确定性的，
+以及双标签播放、执行中暂停、调速、过期请求拒绝、回放状态隔离、历史记录，
+和真实浏览器中的同源 WebSocket 与相机请求。测试用的模型响应是确定性的，
 不需要额外下载模型；真实模型的效果需另行评估。
 
 ## English
@@ -75,6 +98,10 @@ Install `.[browser,robot]`, run `qev studio`, and open `/#robot`. Viser is manag
 automatically and embedded through the website's origin, including its WebSocket.
 The workbench shows a procedural six-axis arm performing a scripted pick-and-place task,
 with missed-grasp, dropped-object and shifted-target demonstrations.
+Playback runs once on the server across tabs, with adjustable speed and dwell time.
+Completed actions and faults are recorded even without inference. Replay recorded 3D
+poses or archived runs without executing skills or changing the live scene; return to
+the live scene to continue. Reports and preferences persist locally across restarts.
 
 OneJev receives a fixed-camera render and the task text, while scene acceptance is
 displayed independently. Model uncertainty and disagreement stay visible. This is a

@@ -250,6 +250,7 @@ class StudioIntegrationTests(unittest.TestCase):
 
         if importlib.util.find_spec("viser") is None:
             self.skipTest("install the robot optional dependencies")
+        self.api("/api/robot/reset", {})
         self.model.replies = [{"placed": {"type": "noul", "noul": .02},
                                "grasped": {"type": "noul", "noul": .03},
                                "location": {"type": "choice", "choice": "table",
@@ -274,6 +275,84 @@ class StudioIntegrationTests(unittest.TestCase):
                 page.locator("#robot-step").click()
                 page.wait_for_function('document.getElementById("robot-phase").textContent === "已靠近物体"')
                 self.assertIn("待判断", page.locator("#robot-verdict").inner_text())
+            finally:
+                browser.close()
+
+    def test_robot_archived_replay_is_read_only_and_stale_controls_are_rejected(self):
+        import importlib.util
+
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        initial = self.api("/api/robot/reset", {})
+        self.api("/api/robot/settings", {"judge": False, "motion_speed": 2})
+        stale = {"run_id": initial["id"], "expected_revision": initial["revision"], "judge": False}
+        moved = self.api("/api/robot/step", stale)
+        self.api("/api/robot/step", stale, expected=409)
+        self.assertEqual(moved["phase"], "hover")
+        self.assertEqual(len(moved["events"]), 2)
+        current = self.api("/api/robot/reset", {})
+        replay = self.api("/api/robot/replay", {"source_id": initial["id"], "event_index": 1})
+        self.assertEqual(replay["id"], current["id"])
+        self.assertEqual(replay["phase"], "ready")
+        self.assertEqual(replay["revision"], 0)
+        self.assertEqual(replay["replay"]["pose"]["phase"], "hover")
+        self.api("/api/robot/step", {"judge": False}, expected=409)
+        self.api("/api/robot/observe", {}, expected=409)
+        self.assertFalse(self.model.requests)
+        archived = self.api(f'/api/robot/runs/{initial["id"]}')
+        self.assertEqual(len(archived["events"]), 2)
+        self.assertIn(initial["id"], [r["id"] for r in self.api("/api/robot/runs")["runs"]])
+        self.api("/api/robot/runs/invalid", expected=404)
+        self.api("/api/robot/settings", {"delay": 0}, expected=422)
+        restored = self.api("/api/robot/live", {})
+        self.assertIsNone(restored["replay"])
+        self.assertEqual(restored["q"], current["q"])
+        self.api("/api/robot/pause", {"run_id": initial["id"]}, expected=409)
+
+    def test_robot_two_tabs_share_playback_after_reload_and_replay_without_inference(self):
+        import importlib.util
+        from playwright.sync_api import sync_playwright
+
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        self.api("/api/robot/reset", {})
+        self.api("/api/robot/settings", {"judge": False, "delay": 15, "motion_speed": 2})
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True,
+                                                 args=["--enable-unsafe-swiftshader"])
+            try:
+                context = browser.new_context(viewport={"width": 1400, "height": 1000})
+                first, second = context.new_page(), context.new_page()
+                errors = []
+                for page in (first, second):
+                    page.on("pageerror", lambda error: errors.append(str(error)))
+                    page.goto(self.base + "/#robot")
+                    page.wait_for_function('document.getElementById("robot-connection").textContent.includes("已连接")')
+                first.locator("#robot-auto").click()
+                first.reload()
+                first.wait_for_function('document.getElementById("robot-auto").textContent.includes("暂停")')
+                second.wait_for_function('document.getElementById("robot-phase").textContent === "已靠近物体"')
+                second.locator("#robot-auto").click()
+                first.wait_for_function('document.getElementById("robot-auto").textContent.includes("自动演示")')
+                state = self.api("/api/robot")
+                self.assertEqual(state["revision"], 1)
+                self.assertFalse(state["auto_running"])
+                first.locator('[data-robot-event="0"]').click()
+                for page in (first, second):
+                    page.wait_for_function('!document.getElementById("robot-replay-notice").hidden')
+                    self.assertTrue(page.locator("#robot-step").is_disabled())
+                    self.assertTrue(page.locator("#robot-observe").is_disabled())
+                self.assertFalse(self.model.requests)
+                self.assertEqual(self.api("/api/robot")["revision"], 1)
+                second.locator("#robot-live").click()
+                first.wait_for_function('document.getElementById("robot-replay-notice").hidden')
+                self.assertEqual(first.locator("#robot-phase").inner_text(), "已靠近物体")
+                first.set_viewport_size({"width": 390, "height": 844})
+                self.assertTrue(first.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
+                # Browser-demo named grid areas must not create implicit robot columns.
+                self.assertEqual(first.locator(".robot-results").evaluate('(el) => getComputedStyle(el).gridTemplateColumns.split(" ").length'), 2)
+                self.assertGreater(first.locator(".robot-results > .next-action").bounding_box()["width"], 250)
+                self.assertFalse(errors)
             finally:
                 browser.close()
 

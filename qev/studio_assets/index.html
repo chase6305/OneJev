@@ -226,6 +226,38 @@
               />动作后自动判断</label
             >
           </div>
+          <div class="card robot-playback">
+            <label for="robot-delay"
+              >动作间停留 <output id="robot-delay-value">3 秒</output></label
+            >
+            <input
+              id="robot-delay"
+              type="range"
+              min="0.5"
+              max="15"
+              step="0.5"
+              value="3"
+              aria-label="动作间停留秒数"
+            />
+            <label for="robot-speed">动作速度</label>
+            <select id="robot-speed" aria-label="动作速度">
+              <option value="0.25">0.25 ×</option>
+              <option value="0.5">0.5 ×</option>
+              <option value="1" selected>1 ×</option>
+              <option value="1.5">1.5 ×</option>
+              <option value="2">2 ×</option>
+            </select>
+            <span id="robot-playback-status" role="status"
+              >逐步执行，随时观察</span
+            >
+          </div>
+          <div id="robot-replay-notice" class="card robot-replay-notice" hidden>
+            <div>
+              <strong>历史姿态回放</strong>
+              <p id="robot-replay-label">仅显示记录，不执行动作。</p>
+            </div>
+            <button id="robot-live" class="secondary">返回当前场景</button>
+          </div>
           <div class="robot-workspace">
             <div class="robot-visual">
               <div class="card robot-viewer">
@@ -254,6 +286,32 @@
                   >先看正常流程，再观察失败时的判断。</small
                 >
               </div>
+              <div class="section-row robot-run-row">
+                <h2>动作与故障轨迹</h2>
+                <div class="robot-run-tools">
+                  <select id="robot-run" aria-label="机器人演示记录">
+                    <option value="">当前演示</option>
+                  </select>
+                  <button
+                    id="robot-runs-refresh"
+                    class="link-button"
+                    title="刷新演示记录"
+                  >
+                    刷新
+                  </button>
+                  <a
+                    id="robot-report"
+                    class="link-button"
+                    download="robot-report.json"
+                    >导出 JSON</a
+                  >
+                </div>
+              </div>
+              <div
+                id="robot-events"
+                class="timeline"
+                aria-label="点击记录回看三维姿态"
+              ></div>
               <div class="section-row">
                 <h2>模型实际看到的画面</h2>
                 <span id="robot-camera-label" class="muted"
@@ -274,7 +332,7 @@
               <div class="section-row">
                 <h2>视觉检查记录</h2>
                 <button id="robot-latest" class="link-button" hidden>
-                  返回最新
+                  返回当前场景
                 </button>
               </div>
               <div id="robot-history" class="timeline">

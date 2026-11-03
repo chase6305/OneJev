@@ -1394,15 +1394,18 @@ dialog button {
   }
   .robot-results {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 8px 24px;
   }
-  .robot-results > .card-eyebrow,
-  .robot-results > .decision-divider,
-  .robot-results > .robot-note,
-  .robot-results > .raw-details,
-  .robot-results > .inline-error {
+  .robot-results > * {
+    grid-area: auto;
+    min-width: 0;
+  }
+  .robot-results > :not(.robot-prob) {
     grid-column: 1/-1;
+  }
+  .robot-results > .card-eyebrow {
+    flex-wrap: wrap;
   }
 }
 @media (max-width: 650px) {
@@ -1430,5 +1433,115 @@ dialog button {
   * {
     animation: none !important;
     transition: none !important;
+  }
+}
+.robot-playback {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 18px;
+  margin: -6px 0 20px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.robot-playback label {
+  white-space: nowrap;
+}
+.robot-playback output {
+  color: var(--green);
+  font-variant-numeric: tabular-nums;
+  margin-left: 8px;
+}
+.robot-playback input[type="range"] {
+  width: 150px;
+  accent-color: var(--green);
+}
+.robot-playback select,
+.robot-run-tools select {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 9px;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+}
+#robot-playback-status {
+  margin-left: auto;
+  font-size: 11px;
+}
+.robot-replay-notice {
+  padding: 14px 18px;
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-color: #acbfa2;
+  background: #edf3e9;
+}
+.robot-replay-notice strong {
+  font-size: 12px;
+  color: var(--green);
+}
+.robot-replay-notice p {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 5px 0 0;
+  line-height: 1.6;
+}
+.robot-run-row {
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.robot-run-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-width: 0;
+}
+.robot-run-tools select {
+  max-width: 290px;
+  font-size: 10px;
+}
+.robot-run-tools a {
+  text-decoration: none;
+}
+.robot-event {
+  min-height: 110px;
+  padding: 14px;
+  text-align: left;
+}
+.robot-event-index {
+  font-family: ui-monospace, monospace;
+  color: #8aa282;
+  font-size: 18px;
+  padding-bottom: 18px;
+  display: block;
+}
+#robot-events {
+  margin-bottom: 6px;
+}
+@media (max-width: 650px) {
+  .robot-playback {
+    gap: 10px;
+    padding: 12px;
+  }
+  .robot-playback input[type="range"] {
+    flex: 1;
+    min-width: 90px;
+  }
+  #robot-playback-status {
+    margin-left: 0;
+    width: 100%;
+    line-height: 1.7;
+  }
+  .robot-replay-notice {
+    flex-wrap: wrap;
+    padding: 12px;
+  }
+  .robot-run-tools select {
+    max-width: 100%;
   }
 }
