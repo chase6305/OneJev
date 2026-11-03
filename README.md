@@ -156,6 +156,8 @@ The optional [Viser robot workbench](examples/robot.md) adds a rotatable six-axi
 scripted pick-and-place skills, fault demonstrations and fixed-camera OneJev checks.
 Its one-click full demo automatically runs a selected preset, including visual checks,
 while retaining uncertain judgments for review; supervised playback can pause on them.
+Play a preset or all four cases for 1–20 rounds, with per-case reports and an archived
+summary. Transient visual failures retry the same observation without repeating motion.
 Install `pip install -e '.[browser,robot]'` and open `/#robot` in the same Studio.
 This is a kinematic visualization with independent scene acceptance, not a dynamics simulator.
 

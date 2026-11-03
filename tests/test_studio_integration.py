@@ -408,6 +408,88 @@ class StudioIntegrationTests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_robot_visual_retry_preserves_failed_evidence_without_repeating_actions(self):
+        import importlib.util
+        from playwright.sync_api import sync_playwright
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        self.api("/api/robot/reset", {"scenario": "normal"})
+        self.api("/api/robot/settings", {"judge": True, "delay": .5, "motion_speed": 2})
+        self.model.replies = [{"placed": {"type": "noul", "noul": .42}, "grasped": {"type": "noul", "noul": .25}}] * 5
+        self.model.fail_next = True
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True,
+                                                 args=["--enable-unsafe-swiftshader"])
+            try:
+                page = browser.new_page(viewport={"width": 1400, "height": 1050})
+                page.goto(self.base + "/#robot")
+                page.wait_for_function('!document.getElementById("robot-autostart").disabled')
+                page.locator("#robot-autostart").click()
+                page.wait_for_function('document.getElementById("robot-phase").textContent === "动作结束"', timeout=60000)
+                result = self.api("/api/robot")
+                self.assertEqual(result["revision"], 5)
+                self.assertEqual(len(result["history"]), 5)
+                self.assertEqual(len(self.model.requests), 6)
+                self.assertEqual(len(result["observation_errors"]), 1)
+                failure = result["observation_errors"][0]
+                self.assertEqual(failure["revision"], result["history"][0]["revision"])
+                self.assertNotEqual(failure["image"], result["history"][0]["image"])
+                self.assertTrue(self.api(failure["image"], binary=True).startswith(b"\x89PNG"))
+                self.assertFalse(result["pending_observation"])
+                self.assertIsNone(result["error"])
+                self.assertTrue(page.locator("#robot-check-errors").is_visible())
+            finally:
+                browser.close()
+
+    def test_robot_playlist_pause_stop_and_archived_summary_work_in_browser(self):
+        import importlib.util
+        from playwright.sync_api import sync_playwright
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        self.api("/api/robot/reset", {"scenario": "normal"})
+        self.api("/api/robot/settings", {"judge": False, "delay": .5, "motion_speed": 2})
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True,
+                                                 args=["--enable-unsafe-swiftshader"])
+            try:
+                page = browser.new_page(viewport={"width": 1400, "height": 1050})
+                errors = []
+                page.on("pageerror", lambda error: errors.append(str(error)))
+                page.goto(self.base + "/#robot")
+                page.wait_for_function('!document.getElementById("robot-autostart").disabled')
+                page.locator("#robot-sequence").select_option("all")
+                page.locator("#robot-autostart").click()
+                page.wait_for_function('document.getElementById("robot-playback-status").textContent.includes("切换到下一案例")', timeout=30000)
+                page.locator("#robot-auto").click()
+                page.wait_for_function('document.getElementById("robot-playlist-status").textContent.includes("已暂停")')
+                paused = self.api("/api/robot")
+                identifier = paused["playlist"]["id"]
+                self.assertEqual(paused["playlist"]["index"], 0)
+                self.assertEqual(paused["phase"], "complete")
+                page.locator("#robot-auto").click()
+                page.wait_for_function('document.getElementById("robot-case-title").textContent === "抓空后重试"', timeout=15000)
+                page.locator("#robot-stop-playlist").click()
+                page.wait_for_function('document.getElementById("robot-playlist-status").textContent.includes("已结束") && !document.getElementById("robot-reset").disabled')
+                report = self.api(f"/api/robot/playlists/{identifier}")
+                self.assertEqual(report["status"], "stopped")
+                self.assertEqual(report["items"][0]["status"], "completed")
+                self.assertIsNone(report["items"][2]["run_id"])
+                page.locator("#robot-reset").click()
+                page.wait_for_function('document.getElementById("robot-phase").textContent === "等待开始"')
+                page.locator("#robot-playlist-select").select_option(identifier)
+                page.wait_for_function('document.getElementById("robot-playlist-status").textContent.includes("历史记录")')
+                self.assertIn(identifier, page.locator("#robot-playlist-report").get_attribute("href"))
+                page.locator("[data-playlist-run]").first.click()
+                page.wait_for_function('!document.getElementById("robot-replay-notice").hidden')
+                self.assertEqual(self.api("/api/robot")["phase"], "ready")
+                page.set_viewport_size({"width": 390, "height": 844})
+                self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+                self.assertFalse(errors)
+                self.api("/api/robot/live", {})
+                self.api("/api/robot/demo", {"rounds": 21, "judge": False}, expected=422)
+            finally:
+                browser.close()
+
     def test_robot_archived_replay_is_read_only_and_stale_controls_are_rejected(self):
         import importlib.util
 

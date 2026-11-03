@@ -368,6 +368,144 @@ class RobotSkillTests(unittest.IsolatedAsyncioTestCase):
         self.controller.pause(RobotControl())
         await self.controller.auto_task
 
+    async def test_playlist_runs_two_rounds_in_order_and_keeps_each_report(self):
+        async def immediate_delay(_delay, **_kwargs):
+            await asyncio.sleep(0)
+        self.controller.wait_between = immediate_delay
+        await self.controller.demo(RobotDemo(sequence="all", rounds=2, judge=False))
+        await asyncio.wait_for(self.controller.auto_task, timeout=8)
+        playlist = self.world.playlist
+        self.assertEqual(playlist["status"], "completed")
+        self.assertEqual([item["scenario"] for item in playlist["items"]], ["normal", "miss", "drop", "shift"] * 2)
+        self.assertEqual(len({item["run_id"] for item in playlist["items"]}), 8)
+        for item in playlist["items"]:
+            self.assertEqual(item["status"], "completed")
+            self.assertTrue(item["truth"]["placed"])
+            saved = read_report(self.world.root, item["run_id"])
+            self.assertEqual(saved["playlist_id"], playlist["id"])
+            self.assertNotIn("playlist", saved)
+        saved = read_report(self.world.root / "playlists", playlist["id"])
+        self.assertEqual(saved["status"], "completed")
+
+    async def test_pausing_between_cases_preserves_the_completed_case_until_resume(self):
+        waiting, release = asyncio.Event(), asyncio.Event()
+        async def wait(_delay, *, cases=False):
+            if cases:
+                waiting.set()
+                await release.wait()
+        self.controller.wait_between = wait
+        await self.controller.demo(RobotDemo(sequence="all", judge=False))
+        await asyncio.wait_for(waiting.wait(), timeout=2)
+        identifier = self.world.id
+        self.controller.pause(RobotControl())
+        async def reset(live):
+            live.reset()
+        with self.assertRaises(HTTPException):
+            await self.controller.operate(reset, RobotControl())
+        self.assertEqual(self.world.id, identifier)
+        release.set()
+        await self.controller.auto_task
+        self.assertEqual(self.world.phase, "complete")
+        self.assertEqual(self.world.id, identifier)
+        self.assertEqual(self.world.playlist["index"], 0)
+        self.assertIsNone(self.world.playlist["items"][1]["run_id"])
+        await self.controller.start(RobotPlayback(judge=False))
+        await asyncio.wait_for(self.controller.auto_task, timeout=5)
+        self.assertEqual(self.world.playlist["status"], "completed")
+        self.assertEqual(self.world.playlist["items"][0]["run_id"], identifier)
+
+    async def test_transient_visual_failure_retries_without_repeating_the_action(self):
+        calls = 0
+        async def observe(_client):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("temporary connection failure")
+            self.world.history.append({"revision": self.world.revision, "truth": self.world.truth(),
+                                       "answers": {"placed": {"noul": .01}, "grasped": {"noul": .01}}})
+            self.controller.pause(RobotControl())
+        self.world.observe = observe
+        await self.controller.demo(RobotDemo(judge=True))
+        await asyncio.wait_for(self.controller.auto_task, timeout=2)
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.world.revision, 1)
+        self.assertEqual(self.world.phase, "hover")
+        self.assertEqual(len(self.world.observation_errors), 1)
+        self.assertEqual(len(self.world.history), 1)
+        self.assertFalse(self.world.pending_observation)
+
+    async def test_resume_retries_failed_observation_before_advancing_scene(self):
+        async def fail(_client):
+            raise OSError("temporary connection failure")
+        self.world.observe = fail
+        await self.controller.demo(RobotDemo(judge=True))
+        await asyncio.wait_for(self.controller.auto_task, timeout=2)
+        original = self.world.pose()
+        self.assertTrue(self.world.pending_observation)
+        async def succeed(_client):
+            self.world.history.append({"revision": self.world.revision, "truth": self.world.truth(),
+                                       "answers": {"placed": {"noul": .01}, "grasped": {"noul": .01}}})
+            self.controller.pause(RobotControl())
+        self.world.observe = succeed
+        await self.controller.start(RobotPlayback(judge=True))
+        await asyncio.wait_for(self.controller.auto_task, timeout=1)
+        self.assertEqual(self.world.pose(), original)
+        self.assertEqual(self.world.revision, 1)
+        self.assertFalse(self.world.pending_observation)
+
+    async def test_stop_during_visual_retry_does_not_start_another_attempt_or_case(self):
+        calls = 0
+        async def fail(_client):
+            nonlocal calls
+            calls += 1
+            raise OSError("temporary connection failure")
+        self.world.observe = fail
+        await self.controller.demo(RobotDemo(sequence="all", judge=True))
+        await self.wait_until(lambda: self.world.retrying_observation)
+        self.controller.stop(RobotControl())
+        await self.controller.auto_task
+        self.assertEqual(calls, 1)
+        self.assertEqual(self.world.revision, 1)
+        self.assertEqual(self.world.playlist["status"], "stopped")
+        self.assertIsNone(self.world.playlist["items"][1]["run_id"])
+
+    async def test_invalid_model_output_is_recorded_without_automatic_retry(self):
+        calls = 0
+        async def fail(_client):
+            nonlocal calls
+            calls += 1
+            raise ValueError("invalid probability")
+        self.world.observe = fail
+        await self.controller.demo(RobotDemo(judge=True))
+        await asyncio.wait_for(self.controller.auto_task, timeout=1)
+        self.assertEqual(calls, 1)
+        self.assertEqual(self.world.observation_errors[0]["message"], "invalid probability")
+
+    async def test_playlist_token_can_pause_after_case_switch_but_cannot_stop_a_new_demo(self):
+        waiting, release = asyncio.Event(), asyncio.Event()
+        gaps = 0
+        async def wait(_delay, *, cases=False):
+            nonlocal gaps
+            if cases:
+                gaps += 1
+                if gaps == 2:
+                    waiting.set()
+                    await release.wait()
+        self.controller.wait_between = wait
+        initial = await self.controller.demo(RobotDemo(sequence="all", judge=False))
+        old = RobotControl(run_id=initial["id"], playlist_id=initial["playlist"]["id"])
+        await asyncio.wait_for(waiting.wait(), timeout=2)
+        self.assertNotEqual(self.world.id, old.run_id)
+        self.controller.pause(old)
+        release.set()
+        await self.controller.auto_task
+        current = await self.controller.demo(RobotDemo(run_id=self.world.id, playlist_id=old.playlist_id, judge=False))
+        with self.assertRaises(HTTPException):
+            self.controller.stop(old)
+        self.assertEqual(self.world.id, current["id"])
+        self.controller.pause(RobotControl())
+        await self.controller.auto_task
+
 
 if __name__ == "__main__":
     unittest.main()

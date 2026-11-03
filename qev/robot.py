@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+from urllib.error import HTTPError, URLError
 from uuid import uuid4
 
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
@@ -132,6 +133,8 @@ class RobotWorld:
         self.lock = asyncio.Lock()
         self.busy = False
         self.auto_running = False
+        self.playlist = None
+        self.viewer_cursor = 0
         self.delay, self.motion_speed = 3., 1.
         self.auto_judge = True
         self.pause_on_review = True
@@ -168,6 +171,10 @@ class RobotWorld:
         self.revision, self.judged_revision = 0, -1
         self.error = None
         self.pause_reason = None
+        self.playlist = None
+        self.pending_observation, self.retrying_observation = False, False
+        self.observation_errors: list[dict] = []
+        self.last_capture = None
         self.draw()
         self.record_event("reset", "初始场景", 0.)
         self.save()
@@ -208,6 +215,9 @@ class RobotWorld:
                 "replay": self.replay, "auto_running": self.auto_running, "delay": self.delay,
                 "motion_speed": self.motion_speed, "auto_judge": self.auto_judge,
                 "pause_on_review": self.pause_on_review,
+                "playlist": self.playlist, "playlist_id": self.playlist["id"] if self.playlist else None,
+                "pending_observation": self.pending_observation, "retrying_observation": self.retrying_observation,
+                "observation_errors": self.observation_errors,
                 "next_step_at": self.next_step_at, "pause_reason": self.pause_reason,
                 "next_action": self.next_action(), "scenario": {"key": self.scenario,
                     **SCENARIOS[self.scenario], "fault_done": self.scenario_fault_done}}
@@ -226,6 +236,7 @@ class RobotWorld:
         payload = self.snapshot()
         # A report describes its own live run, never another run's replay selection.
         payload["replay"] = None
+        payload.pop("playlist")
         temporary = self.path / "report.tmp"
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
         temporary.replace(self.path / "report.json")
@@ -323,6 +334,7 @@ class RobotWorld:
         if skill is None:
             raise HTTPException(409, "动作已结束，可以重置场景再看一次")
         self.revision += 1
+        self.pending_observation = False
         if skill == "approach":
             await self.move([*self.cube[:2], self.cube[2] + .20])
             self.phase = "hover"
@@ -379,6 +391,7 @@ class RobotWorld:
         elif kind == "shift":
             self.tray[0] = -.17 if self.tray[0] > -.10 else -.02
         self.revision += 1
+        self.pending_observation = False
         self.draw()
         if kind == SCENARIOS[self.scenario]["fault"]:
             self.scenario_fault_done = True
@@ -388,6 +401,7 @@ class RobotWorld:
         from PIL import Image
         from scipy.spatial.transform import Rotation
 
+        self.last_capture = None
         clients = self.viewers()
         if not clients:
             raise HTTPException(409, "请等待三维视图连接，再进行视觉判断")
@@ -400,7 +414,8 @@ class RobotWorld:
         rotation = self.np.stack([x, self.np.cross(z, x), z], axis=1)
         quaternion = Rotation.from_matrix(rotation).as_quat()[[3, 0, 1, 2]]
         self.server.flush()
-        viewer = next(iter(clients.values()))
+        viewer = list(clients.values())[self.viewer_cursor % len(clients)]
+        self.viewer_cursor += 1
         frame = await asyncio.to_thread(viewer.get_render, height=720, width=960, position=position,
                                         wxyz=quaternion, fov=.76, transport_format="jpeg", timeout=15)
         stream = io.BytesIO()
@@ -408,6 +423,7 @@ class RobotWorld:
         filename = f"{self.capture_count:04d}.png"
         self.capture_count += 1
         (self.path / filename).write_bytes(stream.getvalue())
+        self.last_capture = f"/api/robot/runs/{self.id}/{filename}"
         started = time.perf_counter()
         response = await asyncio.to_thread(
             client.system_one, {"task": "Put the red cube into the blue tray and release it.", "camera": "<image:1>"},
@@ -436,6 +452,7 @@ class RobotWorld:
 class RobotControl(BaseModel):
     run_id: str | None = None
     expected_revision: int | None = Field(default=None, ge=0)
+    playlist_id: str | None = None
 
 
 class RobotAction(RobotControl):
@@ -459,6 +476,9 @@ class RobotPlayback(RobotAction):
 class RobotDemo(RobotPlayback):
     scenario: Literal["normal", "miss", "drop", "shift"] | None = None
     pause_on_review: Literal[False] = False
+    sequence: Literal["current", "all"] = "current"
+    rounds: int = Field(default=1, ge=1, le=20)
+    case_delay: float = Field(default=5, ge=.5, le=30, allow_inf_nan=False)
 
 
 class RobotReplay(RobotControl):
@@ -475,14 +495,78 @@ class RobotController:
         self.auto_task = None
         self.wake = asyncio.Event()
 
+    def save_playlist(self):
+        playlist = self.live.playlist
+        if not playlist:
+            return
+        path = report_path(self.live.root / "playlists", playlist["id"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(playlist, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        temporary.replace(path)
+
+    def update_item(self):
+        live = self.live
+        playlist = live.playlist
+        if playlist:
+            item = playlist["items"][playlist["index"]]
+            item.update(run_id=live.id, phase=live.phase, steps=max(0, len(live.events) - 1),
+                        checks=len(live.history), reviews=sum(agreement(r) != "判断与场景一致" for r in live.history),
+                        observation_errors=len(live.observation_errors), truth=live.truth(), error=live.error)
+            self.save_playlist()
+
+    def has_next_case(self):
+        playlist = self.live.playlist
+        return bool(playlist and playlist["status"] in ("running", "paused")
+                    and playlist["index"] + 1 < len(playlist["items"]))
+
+    async def check_observation(self, automatic):
+        live = self.live
+        was_pending = live.pending_observation
+        live.pending_observation = True
+        for attempt in range(1, 3 if automatic else 2):
+            live.last_capture = None
+            try:
+                if self.backend.state != "ready":
+                    raise ConnectionError("模型尚未就绪")
+                await live.observe(self.backend.client)
+                live.pending_observation = live.retrying_observation = False
+                live.error = None
+                if was_pending and not live.auto_running:
+                    live.pause_reason = "视觉判断已恢复，可继续自动演示"
+                return
+            except Exception as exc:
+                message = str(getattr(exc, "detail", str(exc)))
+                live.error = f"动作状态已保留，视觉判断暂未完成：{message}"
+                live.observation_errors.append({"revision": live.revision, "attempt": attempt,
+                    "at": datetime.now(timezone.utc).isoformat(), "message": message, "image": live.last_capture})
+                transient = exc.code in (429, 502, 503, 504) if isinstance(exc, HTTPError) else isinstance(exc, (URLError, OSError, TimeoutError))
+                if not automatic or attempt == 2 or not transient or not live.auto_running:
+                    break
+                live.retrying_observation = True
+                live.save()
+                self.wake.clear()
+                try:
+                    await asyncio.wait_for(self.wake.wait(), timeout=.5)
+                except asyncio.TimeoutError:
+                    pass
+                if not live.auto_running:
+                    break
+        live.retrying_observation = False
+
     def validate(self, options, *, revision=True):
-        if options.run_id is not None and options.run_id != self.live.id:
+        same_playlist = bool(options.playlist_id and self.live.playlist and options.playlist_id == self.live.playlist["id"])
+        if options.playlist_id and not same_playlist:
+            raise HTTPException(409, "连播任务已变化，请查看最新状态后再操作")
+        if options.run_id is not None and options.run_id != self.live.id and not (same_playlist and not revision):
             raise HTTPException(409, "场景已被重置，请查看最新状态后再操作")
         if revision and options.expected_revision is not None and options.expected_revision != self.live.revision:
             raise HTTPException(409, "其他页面已推进场景，请查看最新状态后再操作")
 
     async def operate(self, action, options, *, judge=False, from_auto=False, replay_ok=False):
         live = self.live
+        if not from_auto and self.auto_task and not self.auto_task.done() and not live.auto_running:
+            raise HTTPException(409, "播放正在停止，请稍候再操作场景")
         if live.lock.locked():
             raise HTTPException(409, "机械臂正在执行，请稍候")
         async with live.lock:
@@ -495,15 +579,10 @@ class RobotController:
             try:
                 await action(live)
                 if judge:
-                    if self.backend.state == "ready":
-                        try:
-                            await live.observe(self.backend.client)
-                        except Exception as exc:
-                            live.error = f"动作状态已保留，视觉判断暂未完成：{getattr(exc, 'detail', str(exc))}"
-                    else:
-                        live.error = "模型尚未就绪，动作状态已保留，可稍后点击视觉判断"
+                    await self.check_observation(from_auto)
             finally:
                 live.busy = False
+                self.update_item()
                 live.save()
         return live.snapshot()
 
@@ -522,13 +601,19 @@ class RobotController:
         if live.auto_running:
             return live.snapshot()  # A second tab attaches to the existing playback.
         self.check_start(options.judge)
-        if not live.next_action():
+        if not live.next_action() and not self.has_next_case() and not (live.pending_observation and options.judge):
             raise HTTPException(409, "动作已结束，请重置场景")
         live.delay, live.motion_speed = options.delay, options.motion_speed
         live.auto_judge = options.judge
         live.pause_on_review = options.pause_on_review
         live.save_settings()
         live.auto_running, live.pause_reason = True, None
+        if live.playlist and live.playlist["status"] == "paused":
+            live.playlist["status"] = "running"
+            item = live.playlist["items"][live.playlist["index"]]
+            if item["status"] != "completed":
+                item["status"] = "running"
+            self.save_playlist()
         self.wake.clear()
         self.auto_task = asyncio.create_task(self.autoplay())
         live.save()
@@ -543,8 +628,20 @@ class RobotController:
         self.check_start(options.judge)
         # No awaits between validation, reset and start: another tab cannot
         # advance the fresh run before its single automatic executor is created.
-        live.reset(options.scenario)
-        fresh = options.model_copy(update={"run_id": live.id, "expected_revision": 0})
+        self.finish_playlist("stopped")
+        cases = list(SCENARIOS) if options.sequence == "all" else [options.scenario or live.scenario]
+        items = [{"scenario": case, "name": SCENARIOS[case]["name"], "round": round_number,
+                  "run_id": None, "status": "pending", "checks": 0, "reviews": 0}
+                 for round_number in range(1, options.rounds + 1) for case in cases]
+        live.reset(items[0]["scenario"])
+        if len(items) > 1:
+            live.playlist = {"id": uuid4().hex, "created_at": datetime.now(timezone.utc).isoformat(),
+                "status": "running", "sequence": options.sequence, "rounds": options.rounds,
+                "case_delay": options.case_delay, "index": 0, "next_case_at": None, "items": items}
+            items[0].update(run_id=live.id, status="running")
+            self.save_playlist()
+        fresh = options.model_copy(update={"run_id": live.id, "expected_revision": 0,
+                                           "playlist_id": live.playlist["id"] if live.playlist else None})
         return await self.start(fresh)
 
     def pause(self, options):
@@ -552,7 +649,29 @@ class RobotController:
         self.live.auto_running = False
         self.live.next_step_at = None
         self.live.pause_reason = "已暂停，当前动作完成后停留" if self.live.busy else "已暂停"
+        if self.live.playlist and self.live.playlist["status"] == "running":
+            self.live.playlist["status"] = "paused"
+            self.live.playlist["next_case_at"] = None
+            self.save_playlist()
         self.wake.set()
+        self.live.save()
+        return self.live.snapshot()
+
+    def finish_playlist(self, status):
+        playlist = self.live.playlist
+        if playlist and playlist["status"] in ("running", "paused"):
+            self.update_item()
+            playlist["status"], playlist["next_case_at"] = status, None
+            item = playlist["items"][playlist["index"]]
+            if item["status"] != "completed":
+                item["status"] = status
+            self.save_playlist()
+
+    def stop(self, options):
+        self.validate(options, revision=False)
+        self.pause(options)
+        self.finish_playlist("stopped")
+        self.live.pause_reason = "连播已结束，当前动作完成后停留" if self.live.busy else "连播已结束，当前场景已保留"
         self.live.save()
         return self.live.snapshot()
 
@@ -567,36 +686,82 @@ class RobotController:
         self.live.save()
         return self.live.snapshot()
 
+    async def wait_between(self, delay, *, cases=False):
+        live = self.live
+        completed = time.monotonic()
+        try:
+            while live.auto_running:
+                remaining = completed + delay() - time.monotonic()
+                deadline = time.time() + max(0, remaining)
+                if cases:
+                    live.playlist["next_case_at"] = deadline
+                    self.save_playlist()
+                else:
+                    live.next_step_at = deadline
+                if remaining <= 0:
+                    break
+                self.wake.clear()
+                try:
+                    await asyncio.wait_for(self.wake.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+        finally:
+            if cases:
+                live.playlist["next_case_at"] = None
+                self.save_playlist()
+            else:
+                live.next_step_at = None
+
     async def autoplay(self):
         live = self.live
         try:
-            while live.auto_running and live.next_action():
-                await self.operate(lambda w: w.advance(), RobotControl(), judge=live.auto_judge, from_auto=True)
+            while live.auto_running:
+                if live.pending_observation and live.auto_judge:
+                    async def noop(_live):
+                        return None
+                    await self.operate(noop, RobotControl(), judge=True, from_auto=True)
+                elif not live.next_action():
+                    if live.playlist:
+                        live.playlist["items"][live.playlist["index"]]["status"] = "completed"
+                        self.update_item()
+                    if not self.has_next_case():
+                        self.finish_playlist("completed")
+                        live.pause_reason = "连播已完成" if live.playlist and live.playlist["status"] == "completed" else "动作已完成"
+                        break
+                    await self.wait_between(lambda: live.playlist["case_delay"], cases=True)
+                    if not live.auto_running:
+                        break
+                    playlist = live.playlist
+                    live.save()
+                    playlist["index"] += 1
+                    item = playlist["items"][playlist["index"]]
+                    live.reset(item["scenario"])
+                    live.playlist = playlist
+                    item.update(run_id=live.id, status="running")
+                    self.save_playlist()
+                    live.save()
+                    continue
+                else:
+                    await self.operate(lambda w: w.advance(), RobotControl(), judge=live.auto_judge, from_auto=True)
                 if live.error:
-                    live.pause_reason = "视觉请求未完成，演示已暂停"
+                    live.pause_reason = "视觉判断未完成，演示已暂停；继续时将重试当前画面"
                     break
                 if live.auto_judge and live.pause_on_review and agreement(live.history[-1] if live.history else None) != "判断与场景一致":
                     live.pause_reason = "模型判断需要复核，演示已暂停；可检查画面或手动执行"
                     break
-                if not live.next_action():
-                    live.pause_reason = "动作已完成"
-                    break
-                completed = time.monotonic()
-                while live.auto_running:
-                    remaining = completed + live.delay - time.monotonic()
-                    live.next_step_at = time.time() + max(0, remaining)
-                    if remaining <= 0:
-                        break
-                    self.wake.clear()
-                    try:
-                        await asyncio.wait_for(self.wake.wait(), timeout=remaining)
-                    except asyncio.TimeoutError:
-                        break
+                if live.next_action():
+                    await self.wait_between(lambda: live.delay)
         except Exception as exc:
             live.error = f"演示暂停：{getattr(exc, 'detail', str(exc))}"
             live.pause_reason = "执行未完成，请检查当前场景"
         finally:
             live.auto_running, live.next_step_at = False, None
+            if live.playlist and live.playlist["status"] not in ("completed", "stopped"):
+                live.playlist["status"] = "paused"
+                item = live.playlist["items"][live.playlist["index"]]
+                if item["status"] != "completed":
+                    item["status"] = "paused"
+            self.update_item()
             live.save()
 
     async def replay(self, options):
@@ -701,7 +866,10 @@ def install_routes(app, studio):
 
     @app.post("/api/robot/step")
     async def step(options: RobotAction):
-        return await (await controller()).operate(lambda live: live.advance(), options, judge=options.judge)
+        control = await controller()
+        if control.live.pending_observation and options.judge:
+            raise HTTPException(409, "请先重试当前画面的视觉判断，或关闭自动判断后继续")
+        return await control.operate(lambda live: live.advance(), options, judge=options.judge)
 
     @app.post("/api/robot/observe")
     async def observe(options: RobotControl = RobotControl()):
@@ -711,9 +879,11 @@ def install_routes(app, studio):
 
     @app.post("/api/robot/reset")
     async def reset(options: RobotScenario = RobotScenario()):
+        control = await controller()
         async def action(live):
+            control.finish_playlist("stopped")
             live.reset(options.scenario)
-        return await (await controller()).operate(action, options)
+        return await control.operate(action, options)
 
     @app.post("/api/robot/fault")
     async def fault(options: RobotFault):
@@ -730,6 +900,32 @@ def install_routes(app, studio):
     @app.post("/api/robot/pause")
     async def pause(options: RobotControl):
         return (await controller()).pause(options)
+
+    @app.post("/api/robot/stop")
+    async def stop(options: RobotControl):
+        return (await controller()).stop(options)
+
+    @app.get("/api/robot/playlists")
+    async def playlists():
+        live = await world()
+        reports = []
+        for path in sorted((live.root / "playlists").glob("*/report.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                report = read_report(live.root / "playlists", path.parent.name)
+                reports.append({"id": report["id"], "created_at": report["created_at"], "status": report["status"],
+                                "completed": sum(i["status"] == "completed" for i in report["items"]), "total": len(report["items"])})
+            except (HTTPException, KeyError, TypeError):
+                continue
+            if len(reports) >= 100:
+                break
+        return {"playlists": reports}
+
+    @app.get("/api/robot/playlists/{identifier}")
+    async def playlist_report(identifier: str):
+        live = await world()
+        if live.playlist and live.playlist["id"] == identifier:
+            return live.playlist
+        return read_report(live.root / "playlists", identifier)
 
     @app.post("/api/robot/settings")
     async def settings(options: RobotPlayback):

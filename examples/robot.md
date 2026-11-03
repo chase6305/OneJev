@@ -35,7 +35,7 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 这个入口会关闭“需要复核时暂停”。模型不确定或判断与场景验收不一致时，只记录原始
 结果，继续播放；结束后显示检查次数和需要复核的次数，不会把这些判断改成成功。
 如果不希望自动继续，可先暂停并勾选“需要复核时暂停”，再用工具栏的“自动演示”从当前
-动作继续。执行错误、相机或模型请求失败仍会暂停；暂停按钮始终可用。
+动作继续。执行错误或持续的视觉请求失败仍会暂停；暂停按钮始终可用。
 
 模型检查需要保留至少一个已连接的浏览器三维视图。全自动指演示流程自动运行，
 动作仍由预设技能与逆运动学执行，当前版本不包含模型自主规划或真机控制。
@@ -51,8 +51,8 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 “让模型看一眼”只进行视觉判断，不执行任何动作。“自动演示”默认在每个技能之间
 停留 3 秒，可用滑块调整为 0.5–15 秒，动作速度可选 0.25–2 倍。暂停会在当前技能
 结束后生效。开启“需要复核时暂停”后，判断不确定或与场景验收冲突时会暂停。
-模型请求或执行失败始终会暂停。
-仍可手动检查画面和执行技能。若只想连续看完整动作，可先关闭“动作后自动判断”。
+持续的模型请求失败或执行失败会暂停。
+仍可手动检查画面和执行技能。若只想播放动作，可关闭“动作后自动判断”。
 
 自动演示由服务端统一推进。刷新页面、切换网站标签或关闭浏览器标签不会另开一轮演示，
 重新进入会显示当前进度；要停止后续动作，请点击“暂停演示”。同一 Studio 的多个页面
@@ -63,6 +63,32 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 服务端的自动演示可能仍在继续，不会因为浏览器暂时断线而重复开始。
 如需暂停，恢复连接后点击“暂停演示”。只有一份浏览器三维视图时，关闭该视图会使
 后续相机检查无法完成，自动演示会按原有错误处理暂停。
+
+## 连播与结果汇总
+
+“播放范围”可选择当前案例，或依次播放正常抓放、抓空重试、掉落恢复、目标移动。
+轮数可选 1–20；例如选择四个案例和两轮，会创建八次独立演示。点击“一键全自动”
+开始，案例之间默认停留 5 秒，页面显示切换倒计时。
+
+“暂停演示”会保留当前案例和连播进度。若在案例间暂停，会停留在已完成的场景，
+点击工具栏“自动演示”后再切换到下一例。“结束连播”会取消剩余案例，当前步骤
+完成后停留，已有报告继续保留。点击“一键全自动”则创建一条新的任务。
+
+“连播进度与记录”汇总每例的完成状态、视觉检查数、需要复核的次数和请求异常数。
+暂停或结束后，可点击“回看”查看某一例的三维记录，也可导出汇总 JSON。
+下拉框可选择最近 100 条历史连播记录。报告保存在
+`runs/studio/robot/playlists/<连播 ID>/report.json`，各案例的独立报告通过 `playlist_id`
+关联。网站重启后可回看历史，但不会自动恢复旧任务的执行。
+
+## 视觉请求失败后的恢复
+
+自动演示遇到临时网络、相机超时或服务繁忙时，会对当前场景重试一次视觉检查，
+不会重新执行刚才的动作。失败的请求、当时已捕获的画面和重试后的结果都保留，
+可在“视觉请求异常记录”或报告中查看。请求异常数包含已成功恢复的重试。
+
+两次请求仍失败时，演示暂停并保留姿态。重新点击“自动演示”会先重试当前画面的
+判断，通过后才执行下一动作；也可单独点击“重试当前画面”。无效的模型输出不会
+自动重试。关闭自动判断后，可以明确选择继续播放动作。
 
 ## 故障与恢复
 
@@ -142,8 +168,16 @@ Select a preset and click the one-click full demo to start a fresh run with no
 per-step confirmations. Actions, scheduled faults, recovery and enabled visual checks
 run automatically; uncertain/disagreeing predictions are recorded without pausing.
 Pause and enable pause-on-review for supervised playback from the current state. Execution,
-camera and inference errors still stop playback, and visual checks require a connected
+camera and persistent inference errors still stop playback, and visual checks require a connected
 browser viewer. This automates the demonstration, not model-driven motion planning.
+
+Select the current case or all four presets, choose 1–20 rounds, and start a playlist.
+Cases have independent reports and a shared summary with replay links and JSON export.
+Pause preserves progress, while ending playback cancels remaining cases and retains
+the scene. Archived summaries survive website restarts; execution never resumes by itself.
+Transient visual-request failures are retried once without repeating motion. If both
+attempts fail, resume first retries the same scene's observation. Failed request evidence
+and captured images remain available alongside successful checks.
 
 OneJev receives a fixed-camera render and the task text, while scene acceptance is
 displayed independently. Model uncertainty and disagreement stay visible. This is a

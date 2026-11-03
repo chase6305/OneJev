@@ -228,6 +228,21 @@
               <button id="robot-autostart" class="primary">
                 ▶ 一键全自动
               </button>
+              <div class="robot-sequence-options">
+                <label for="robot-sequence">播放范围</label>
+                <select id="robot-sequence">
+                  <option value="current">当前案例</option>
+                  <option value="all">四个案例依次播放</option>
+                </select>
+                <label for="robot-rounds">轮数</label
+                ><input
+                  id="robot-rounds"
+                  type="number"
+                  min="1"
+                  max="20"
+                  value="1"
+                />
+              </div>
               <small id="robot-demo-hint"
                 >从头自动执行当前案例，模型判断仅记录，不因复核结论暂停。</small
               >
@@ -253,6 +268,9 @@
             ><button class="secondary" id="robot-observe">让模型看一眼</button
             ><button class="secondary" id="robot-auto">▶ 自动演示</button
             ><button class="secondary" id="robot-reset">↻ 重置场景</button>
+            <button class="secondary" id="robot-stop-playlist" disabled>
+              结束连播
+            </button>
             <div class="robot-checks">
               <label class="robot-check"
                 ><input
@@ -293,6 +311,36 @@
             <span id="robot-playback-status" role="status"
               >逐步执行，随时观察</span
             >
+          </div>
+          <div class="card robot-playlist" id="robot-playlist" hidden>
+            <div class="section-row">
+              <h2>连播进度与记录</h2>
+              <div class="robot-run-tools">
+                <select id="robot-playlist-select" aria-label="连播记录">
+                  <option value="">当前连播</option>
+                </select>
+                <a
+                  id="robot-playlist-report"
+                  class="link-button"
+                  download="robot-playlist.json"
+                  >导出汇总</a
+                >
+              </div>
+            </div>
+            <p id="robot-playlist-status" role="status"></p>
+            <div class="robot-playlist-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>轮 / 案例</th>
+                    <th>状态</th>
+                    <th>检查 / 复核 / 请求异常</th>
+                    <th>记录</th>
+                  </tr>
+                </thead>
+                <tbody id="robot-playlist-rows"></tbody>
+              </table>
+            </div>
           </div>
           <div id="robot-replay-notice" class="card robot-replay-notice" hidden>
             <div>
@@ -401,6 +449,16 @@
               <div id="robot-history" class="timeline">
                 <div class="empty-line">还没有视觉检查记录。</div>
               </div>
+              <details
+                id="robot-check-errors"
+                class="card robot-check-errors"
+                hidden
+              >
+                <summary id="robot-check-errors-summary">
+                  视觉请求异常记录
+                </summary>
+                <div id="robot-check-errors-list"></div>
+              </details>
             </div>
             <aside class="card robot-results">
               <div class="card-eyebrow">

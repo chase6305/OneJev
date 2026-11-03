@@ -14,6 +14,10 @@ window.OneJevRobot = (() => {
     initialized = false,
     starting = null;
   let draftDelay = null;
+  let playlistArchive = null,
+    playlistSelection = "",
+    playlistCount = 0,
+    runsRevision = 0;
   let online = false,
     viewerReady = false,
     showViewSettings = false,
@@ -91,6 +95,11 @@ window.OneJevRobot = (() => {
     }
     const busy = working || state.busy || !online;
     const auto = state.auto_running;
+    const playlist = state.playlist;
+    const nextCase =
+      playlist &&
+      ["running", "paused"].includes(playlist.status) &&
+      playlist.index + 1 < playlist.items.length;
     const replay = state.replay;
     const source =
       replay && replay.run_id !== state.id
@@ -111,7 +120,9 @@ window.OneJevRobot = (() => {
       : replay
         ? "历史姿态 · 不执行动作"
         : busy
-          ? "正在执行技能…"
+          ? state.retrying_observation
+            ? "正在重试视觉检查…"
+            : "正在执行技能…"
           : state.phase_label;
     $("robot-connection").textContent = !online
       ? "工作台连接中断"
@@ -123,7 +134,12 @@ window.OneJevRobot = (() => {
       : "动作已完成";
     $("robot-next").textContent = replay
       ? "返回当前场景后继续"
-      : nextLabel || "动作已完成，可重置场景";
+      : state.pending_observation && state.auto_judge
+        ? "重试当前画面的判断"
+        : nextLabel ||
+          (nextCase
+            ? `下一案例：${playlist.items[playlist.index + 1].name}`
+            : "动作已完成，可重置场景");
     const requireModel = state.auto_judge;
     $("robot-step").disabled =
       busy ||
@@ -131,8 +147,12 @@ window.OneJevRobot = (() => {
       !!replay ||
       !nextLabel ||
       !state.clients ||
+      (state.pending_observation && requireModel) ||
       (requireModel && !isReady());
     $("robot-observe").disabled = busy || auto || !!replay || !isReady();
+    $("robot-observe").textContent = state.pending_observation
+      ? "重试当前画面"
+      : "让模型看一眼";
     $("robot-reset").disabled = busy || auto || !!replay;
     $("robot-auto").textContent = auto ? "Ⅱ 暂停演示" : "▶ 自动演示";
     $("robot-auto").disabled =
@@ -141,7 +161,9 @@ window.OneJevRobot = (() => {
       (!auto &&
         (busy ||
           !!replay ||
-          !nextLabel ||
+          (!nextLabel &&
+            !nextCase &&
+            !(state.pending_observation && requireModel)) ||
           !state.clients ||
           (requireModel && !isReady())));
     $("robot-miss").disabled =
@@ -161,15 +183,29 @@ window.OneJevRobot = (() => {
       : selectedScenario;
     $("robot-scenario").disabled = busy || auto || !!replay;
     $("robot-load-scenario").disabled = busy || auto || !!replay;
+    $("robot-stop-playlist").disabled =
+      working ||
+      !online ||
+      !playlist ||
+      !["running", "paused"].includes(playlist.status);
+    for (const id of ["robot-sequence", "robot-rounds"])
+      $(id).disabled = busy || auto || !!replay;
+    if (auto && playlist) {
+      $("robot-sequence").value = playlist.sequence;
+      $("robot-rounds").value = playlist.rounds;
+    }
     $("robot-autostart").disabled =
       busy ||
       auto ||
       !!replay ||
       !state.clients ||
       (requireModel && !isReady());
-    $("robot-demo-hint").textContent = requireModel
-      ? "从头自动执行当前案例与视觉检查；不确定或有分歧的判断只记录，不暂停。"
-      : "从头自动执行当前案例与故障恢复，不调用模型。";
+    const plannedCases =
+      ($("robot-sequence").value === "all" ? 4 : 1) *
+      Number($("robot-rounds").value);
+    const caseDelay = auto && playlist ? playlist.case_delay : 5;
+    $("robot-demo-hint").textContent =
+      `${plannedCases > 1 ? `将连播 ${plannedCases} 个案例，案例间停留 ${caseDelay} 秒。` : "从头自动执行当前案例。"}${requireModel ? "视觉判断仅记录，不因复核结论暂停。" : "播放动作与故障恢复，不调用模型。"}`;
     $("robot-case-title").textContent =
       `${shownCase?.name || "自由演示"}${replay ? " · 正在回放历史" : ""}`;
     $("robot-case-description").textContent =
@@ -199,13 +235,15 @@ window.OneJevRobot = (() => {
     $("robot-playback-status").textContent = replay
       ? "回放不会调用模型或执行技能"
       : auto
-        ? state.busy
-          ? state.auto_judge && !state.pause_on_review
-            ? "全自动演示中 · 模型判断仅记录"
-            : "自动演示中 · 可随时暂停"
-          : state.next_step_at
-            ? `${Math.max(0, Math.ceil(state.next_step_at - Date.now() / 1000))} 秒后执行下一动作`
-            : "正在开始演示…"
+        ? playlist?.next_case_at
+          ? `${Math.max(0, Math.ceil(playlist.next_case_at - Date.now() / 1000))} 秒后切换到下一案例`
+          : state.busy
+            ? state.auto_judge && !state.pause_on_review
+              ? "全自动演示中 · 模型判断仅记录"
+              : "自动演示中 · 可随时暂停"
+            : state.next_step_at
+              ? `${Math.max(0, Math.ceil(state.next_step_at - Date.now() / 1000))} 秒后执行下一动作`
+              : "正在开始演示…"
         : state.pause_reason ||
           (state.auto_judge
             ? state.pause_on_review
@@ -247,6 +285,7 @@ window.OneJevRobot = (() => {
     $("robot-time").textContent = fresh ? ms(record.request_s) : "—";
     $("robot-error").hidden = !state.error;
     $("robot-error").textContent = state.error || "";
+    renderPlaylist(busy, auto);
     $("robot-raw").textContent = record
       ? JSON.stringify(record, null, 2)
       : "暂无结果";
@@ -296,6 +335,20 @@ window.OneJevRobot = (() => {
         );
     }
     const history = source?.history || [];
+    const errors = source?.observation_errors || [];
+    $("robot-check-errors").hidden = !errors.length;
+    $("robot-check-errors-summary").textContent =
+      `视觉请求异常记录 · ${errors.length} 次`;
+    const errorSignature = `${source?.id}:${errors.length}`;
+    if ($("robot-check-errors-list").dataset.signature !== errorSignature) {
+      $("robot-check-errors-list").dataset.signature = errorSignature;
+      $("robot-check-errors-list").innerHTML = errors
+        .map(
+          (item) =>
+            `<p>状态 ${item.revision} · 第 ${item.attempt} 次检查 · ${esc(item.message)}${item.image ? ` · <a href="${esc(item.image)}" target="_blank" rel="noopener">当时画面</a>` : ""}</p>`,
+        )
+        .join("");
+    }
     const signature = `${source?.id}:${history.length}:${replay?.history_index}:${busy}:${auto}`;
     if ($("robot-history").dataset.signature !== signature) {
       $("robot-history").dataset.signature = signature;
@@ -319,11 +372,68 @@ window.OneJevRobot = (() => {
         );
     }
   }
+  function renderPlaylist(busy, auto) {
+    const playlist = playlistSelection ? playlistArchive : state.playlist;
+    const labels = {
+      running: "播放中",
+      paused: "已暂停",
+      completed: "已完成",
+      stopped: "已结束",
+      pending: "等待播放",
+    };
+    $("robot-playlist").hidden = !playlist && !playlistCount;
+    $("robot-playlist-select").value = playlistSelection;
+    $("robot-playlist-report").hidden = !playlist;
+    $("robot-playlist-report").href = playlist
+      ? `/api/robot/playlists/${playlist.id}`
+      : "#";
+    $("robot-playlist-status").textContent = playlist
+      ? `${labels[playlist.status] || playlist.status} · 已完成 ${playlist.items.filter((item) => item.status === "completed").length} / ${playlist.items.length} 个案例${playlist === state.playlist ? " · 多标签页同步" : " · 历史记录"}`
+      : "选择一条历史连播记录，或设置播放范围后开始全自动演示。";
+    const items = playlist?.items || [];
+    const signature = JSON.stringify([
+      playlist?.id,
+      playlist?.index,
+      state.replay?.run_id,
+      items,
+      busy,
+      auto,
+    ]);
+    if ($("robot-playlist-rows").dataset.signature === signature) return;
+    $("robot-playlist-rows").dataset.signature = signature;
+    $("robot-playlist-rows").innerHTML = items
+      .map(
+        (item, index) =>
+          `<tr class="${(state.replay ? item.run_id === state.replay.run_id : !playlistSelection && index === playlist.index) ? "current" : ""}"><td>${item.round} / ${esc(item.name)}<small class="robot-playlist-case-status">${esc(labels[item.status] || item.status)}</small></td><td>${esc(labels[item.status] || item.status)}</td><td>${item.checks || 0} / ${item.reviews || 0} / ${item.observation_errors || 0}</td><td><button class="link-button" data-playlist-run="${esc(item.run_id || "")}" ${busy || auto || !item.run_id ? "disabled" : ""}>回看</button></td></tr>`,
+      )
+      .join("");
+    $("robot-playlist-rows")
+      .querySelectorAll("[data-playlist-run]")
+      .forEach((button) =>
+        button.addEventListener("click", async () => {
+          try {
+            const report = await robotApi(
+              `/api/robot/runs/${button.dataset.playlistRun}`,
+            );
+            await perform("replay", {
+              source_id: report.id,
+              event_index: report.events.length - 1,
+            });
+          } catch (error) {
+            toast(error.message);
+          }
+        }),
+      );
+  }
   async function perform(action, body = {}) {
     if (working || !state) return false;
     const epoch = ++viewRevision;
     working = true;
-    const control = { run_id: state.id, expected_revision: state.revision };
+    const control = {
+      run_id: state.id,
+      expected_revision: state.revision,
+      playlist_id: state.playlist?.id,
+    };
     render();
     try {
       const result = await robotApi(`/api/robot/${action}`, {
@@ -349,9 +459,13 @@ window.OneJevRobot = (() => {
     }
   }
   async function loadRuns() {
+    const revision = ++runsRevision;
     try {
-      const result = await robotApi("/api/robot/runs");
-      if (!state) return;
+      const [result, queues] = await Promise.all([
+        robotApi("/api/robot/runs"),
+        robotApi("/api/robot/playlists"),
+      ]);
+      if (!state || revision !== runsRevision) return;
       $("robot-run").innerHTML =
         '<option value="">当前演示</option>' +
         result.runs
@@ -359,6 +473,16 @@ window.OneJevRobot = (() => {
           .map(
             (run) =>
               `<option value="${esc(run.id)}">${esc(run.created_at ? new Date(run.created_at).toLocaleString() : run.id.slice(0, 8))} · ${esc(run.scenario || "自由演示")} · ${esc(run.phase_label)} · ${run.events} 帧</option>`,
+          )
+          .join("");
+      playlistCount = queues.playlists.length;
+      $("robot-playlist-select").innerHTML =
+        '<option value="">当前连播</option>' +
+        queues.playlists
+          .filter((item) => item.id !== state.playlist?.id)
+          .map(
+            (item) =>
+              `<option value="${esc(item.id)}">${esc(new Date(item.created_at).toLocaleString())} · ${item.completed}/${item.total}</option>`,
           )
           .join("");
       runsLoaded = true;
@@ -477,13 +601,35 @@ window.OneJevRobot = (() => {
     motion_speed: Number($("robot-speed").value),
     pause_on_review: $("robot-pause-review").checked,
   });
-  $("robot-autostart").addEventListener("click", () =>
+  $("robot-autostart").addEventListener("click", () => {
+    if (!$("robot-rounds").reportValidity()) return;
     perform("demo", {
       ...playbackOptions(),
       scenario: selectedScenario,
       pause_on_review: false,
-    }),
-  );
+      sequence: $("robot-sequence").value,
+      rounds: Number($("robot-rounds").value),
+    });
+  });
+  for (const id of ["robot-sequence", "robot-rounds"])
+    $(id).addEventListener("input", render);
+  $("robot-stop-playlist").addEventListener("click", () => perform("stop"));
+  $("robot-playlist-select").addEventListener("change", async () => {
+    playlistSelection = $("robot-playlist-select").value;
+    playlistArchive = null;
+    const identifier = playlistSelection;
+    render();
+    if (!identifier) return;
+    try {
+      const report = await robotApi(`/api/robot/playlists/${identifier}`);
+      if (playlistSelection === identifier) {
+        playlistArchive = report;
+        render();
+      }
+    } catch (error) {
+      toast(error.message);
+    }
+  });
   $("robot-step").addEventListener("click", () =>
     perform("step", { judge: $("robot-auto-judge").checked }),
   );
