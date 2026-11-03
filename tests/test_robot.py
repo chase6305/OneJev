@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi import HTTPException
-from qev.robot import Kinematics, RobotWorld, RobotController, RobotControl, RobotPlayback, RobotReplay, read_report
+from qev.robot import Kinematics, RobotWorld, RobotController, RobotControl, RobotPlayback, RobotDemo, RobotReplay, read_report
 
 HAS_ROBOT = all(importlib.util.find_spec(name) is not None for name in ("viser", "scipy", "numpy"))
 
@@ -185,7 +185,7 @@ class RobotSkillTests(unittest.IsolatedAsyncioTestCase):
         self.controller.pause(RobotControl())
         await self.controller.auto_task
         preferences = json.loads((self.world.root / "settings.json").read_text())
-        self.assertEqual(preferences, {"delay": .5, "motion_speed": .5, "judge": False})
+        self.assertEqual(preferences, {"delay": .5, "motion_speed": .5, "judge": False, "pause_on_review": True})
 
     async def test_uncertain_visual_result_pauses_without_rewriting_probability(self):
         async def observe(_client):
@@ -244,13 +244,14 @@ class RobotSkillTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_world_restores_preferences_and_archives_without_resuming_actions(self):
         await self.controller.operate(lambda w: w.execute(), RobotControl())
         old_id = self.world.id
-        self.controller.settings(RobotPlayback(judge=False, delay=7, motion_speed=.5))
+        self.controller.settings(RobotPlayback(judge=False, delay=7, motion_speed=.5, pause_on_review=False))
         restarted = RobotWorld(Path(self.temp.name))
         try:
             self.assertNotEqual(restarted.id, old_id)
             self.assertEqual(restarted.phase, "ready")
             self.assertFalse(restarted.auto_running)
             self.assertEqual((restarted.delay, restarted.motion_speed, restarted.auto_judge), (7, .5, False))
+            self.assertFalse(restarted.pause_on_review)
             self.assertEqual(len(read_report(restarted.root, old_id)["events"]), 2)
         finally:
             restarted.close()
@@ -308,6 +309,64 @@ class RobotSkillTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException):
             self.world.reset("unknown")
         self.assertEqual(self.world.id, initial)
+
+    async def test_full_demo_records_uncertain_and_disagreeing_checks_and_finishes(self):
+        async def observe(_client):
+            self.world.history.append({"revision": self.world.revision, "truth": self.world.truth(),
+                                       "answers": {"placed": {"noul": .42}, "grasped": {"noul": .99}}})
+            return self.world.history[-1]
+
+        self.world.observe = observe
+        old_id = self.world.id
+        state = await self.controller.demo(RobotDemo(run_id=old_id, expected_revision=0, judge=True, delay=.5))
+        self.assertNotEqual(state["id"], old_id)
+        self.assertFalse(state["pause_on_review"])
+        await asyncio.wait_for(self.controller.auto_task, timeout=4)
+        self.assertEqual(self.world.phase, "complete")
+        self.assertTrue(self.world.truth()["placed"])
+        self.assertEqual(len(self.world.history), 5)
+        self.assertEqual(self.world.pause_reason, "动作已完成")
+        self.assertEqual([r["answers"]["placed"]["noul"] for r in self.world.history], [.42] * 5)
+
+    async def test_full_demo_does_not_ignore_inference_errors_or_repeat_motion(self):
+        async def observe(_client):
+            raise OSError("model unavailable")
+
+        self.world.observe = observe
+        await self.controller.demo(RobotDemo(judge=True, delay=.5))
+        await asyncio.wait_for(self.controller.auto_task, timeout=1)
+        self.assertFalse(self.world.auto_running)
+        self.assertEqual(self.world.phase, "hover")
+        self.assertEqual(self.world.revision, 1)
+        self.assertIn("model unavailable", self.world.error)
+
+    async def test_full_demo_checks_preconditions_before_resetting_the_current_run(self):
+        await self.world.execute()
+        initial = self.world.snapshot()
+        self.controller.backend.state = "offline"
+        with self.assertRaises(HTTPException):
+            await self.controller.demo(RobotDemo(judge=True))
+        self.assertEqual(self.world.id, initial["id"])
+        self.assertEqual(self.world.revision, initial["revision"])
+        with self.assertRaises(HTTPException):
+            await self.controller.demo(RobotDemo(run_id="outdated", judge=False))
+        self.assertEqual(self.world.id, initial["id"])
+
+    async def test_full_demo_can_restart_a_completed_case_and_rejects_a_second_start(self):
+        self.world.reset("drop")
+        while self.world.next_action():
+            await self.world.advance()
+        self.world.save()
+        old_id = self.world.id
+        state = await self.controller.demo(RobotDemo(scenario="miss", judge=False, delay=15))
+        self.assertNotEqual(state["id"], old_id)
+        self.assertEqual(state["scenario"]["key"], "miss")
+        self.assertEqual(read_report(self.world.root, old_id)["phase"], "complete")
+        with self.assertRaises(HTTPException):
+            await self.controller.demo(RobotDemo(judge=False))
+        self.assertEqual(self.world.id, state["id"])
+        self.controller.pause(RobotControl())
+        await self.controller.auto_task
 
 
 if __name__ == "__main__":

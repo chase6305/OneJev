@@ -367,6 +367,47 @@ class StudioIntegrationTests(unittest.TestCase):
         self.assertFalse(self.model.requests)
         self.api("/api/robot/reset", {"scenario": "unknown"}, expected=422)
 
+    def test_robot_one_click_demo_completes_with_uncertain_model_checks(self):
+        import importlib.util
+        from playwright.sync_api import sync_playwright
+
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        initial = self.api("/api/robot/reset", {"scenario": "normal"})
+        self.api("/api/robot/settings", {"judge": True, "delay": .5, "motion_speed": 2})
+        self.model.replies = [{"placed": {"type": "noul", "noul": .42},
+                               "grasped": {"type": "noul", "noul": .99},
+                               "location": {"type": "choice", "choice": "table"}}] * 7
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True,
+                                                 args=["--enable-unsafe-swiftshader"])
+            try:
+                page = browser.new_page(viewport={"width": 1400, "height": 1050})
+                errors = []
+                page.on("pageerror", lambda error: errors.append(str(error)))
+                page.goto(self.base + "/#robot")
+                page.wait_for_function('!document.getElementById("robot-autostart").disabled')
+                page.locator("#robot-scenario").select_option("drop")
+                # No separate load/reset or per-step confirmations are needed.
+                page.locator("#robot-autostart").click()
+                page.wait_for_function('document.getElementById("robot-phase").textContent === "动作结束"', timeout=60000)
+                result = self.api("/api/robot")
+                self.assertNotEqual(result["id"], initial["id"])
+                self.assertEqual(result["scenario"]["key"], "drop")
+                self.assertFalse(result["pause_on_review"])
+                self.assertFalse(result["auto_running"])
+                self.assertTrue(result["truth"]["placed"])
+                self.assertEqual(len(result["history"]), 7)
+                self.assertEqual(len(self.model.requests), 7)
+                self.assertTrue(all(record["answers"]["placed"]["noul"] == .42 for record in result["history"]))
+                self.assertEqual(len([e for e in result["events"] if e["kind"] == "fault"]), 1)
+                self.assertFalse(page.locator("#robot-pause-review").is_checked())
+                self.assertIn("需复核", page.locator("#robot-case-progress").inner_text())
+                self.assertTrue(page.locator("#robot-autostart").is_enabled())
+                self.assertFalse(errors)
+            finally:
+                browser.close()
+
     def test_robot_archived_replay_is_read_only_and_stale_controls_are_rejected(self):
         import importlib.util
 

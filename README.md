@@ -154,6 +154,8 @@ starts local Flide. If inference uses a different environment, pass
 
 The optional [Viser robot workbench](examples/robot.md) adds a rotatable six-axis arm,
 scripted pick-and-place skills, fault demonstrations and fixed-camera OneJev checks.
+Its one-click full demo automatically runs a selected preset, including visual checks,
+while retaining uncertain judgments for review; supervised playback can pause on them.
 Install `pip install -e '.[browser,robot]'` and open `/#robot` in the same Studio.
 This is a kinematic visualization with independent scene acceptance, not a dynamics simulator.
 

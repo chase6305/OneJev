@@ -1632,3 +1632,35 @@ dialog button {
     padding: 10px;
   }
 }
+#robot-autostart,
+#robot-demo-hint {
+  grid-column: 1/-1;
+}
+#robot-autostart {
+  justify-content: center;
+}
+#robot-demo-hint {
+  font-size: 10px;
+  line-height: 1.8;
+  color: var(--muted);
+}
+.robot-checks {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-left: auto;
+}
+.robot-checks .robot-check {
+  margin-left: 0;
+}
+@media (max-width: 650px) {
+  .robot-checks {
+    width: 100%;
+    margin-left: 0;
+    gap: 8px 16px;
+  }
+  .robot-checks .robot-check {
+    width: auto;
+  }
+}

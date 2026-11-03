@@ -134,9 +134,11 @@ class RobotWorld:
         self.auto_running = False
         self.delay, self.motion_speed = 3., 1.
         self.auto_judge = True
+        self.pause_on_review = True
         try:
             preferences = RobotPlayback.model_validate(json.loads((self.root / "settings.json").read_text(encoding="utf-8")))
             self.delay, self.motion_speed, self.auto_judge = preferences.delay, preferences.motion_speed, preferences.judge
+            self.pause_on_review = preferences.pause_on_review
         except (OSError, ValueError, TypeError):
             pass
         self.next_step_at = None
@@ -205,6 +207,7 @@ class RobotWorld:
                 "schema_version": 2, "created_at": self.created_at, "events": self.events,
                 "replay": self.replay, "auto_running": self.auto_running, "delay": self.delay,
                 "motion_speed": self.motion_speed, "auto_judge": self.auto_judge,
+                "pause_on_review": self.pause_on_review,
                 "next_step_at": self.next_step_at, "pause_reason": self.pause_reason,
                 "next_action": self.next_action(), "scenario": {"key": self.scenario,
                     **SCENARIOS[self.scenario], "fault_done": self.scenario_fault_done}}
@@ -230,7 +233,7 @@ class RobotWorld:
     def save_settings(self):
         temporary = self.root / "settings.tmp"
         temporary.write_text(json.dumps({"delay": self.delay, "motion_speed": self.motion_speed,
-                                         "judge": self.auto_judge}), encoding="utf-8")
+                                         "judge": self.auto_judge, "pause_on_review": self.pause_on_review}), encoding="utf-8")
         temporary.replace(self.root / "settings.json")
 
     def pose(self):
@@ -450,6 +453,12 @@ class RobotScenario(RobotControl):
 class RobotPlayback(RobotAction):
     delay: float = Field(default=3, ge=.5, le=15, allow_inf_nan=False)
     motion_speed: float = Field(default=1, ge=.25, le=2, allow_inf_nan=False)
+    pause_on_review: bool = True
+
+
+class RobotDemo(RobotPlayback):
+    scenario: Literal["normal", "miss", "drop", "shift"] | None = None
+    pause_on_review: Literal[False] = False
 
 
 class RobotReplay(RobotControl):
@@ -498,27 +507,45 @@ class RobotController:
                 live.save()
         return live.snapshot()
 
+    def check_start(self, judge):
+        live = self.live
+        if live.lock.locked() or (self.auto_task and not self.auto_task.done()):
+            raise HTTPException(409, "当前动作正在结束，请稍候")
+        if live.replay:
+            raise HTTPException(409, "请先返回当前场景，再开始演示")
+        if judge and self.backend.state != "ready":
+            raise HTTPException(409, "请等待模型就绪，或关闭动作后自动判断")
+
     async def start(self, options):
         live = self.live
         self.validate(options)
         if live.auto_running:
             return live.snapshot()  # A second tab attaches to the existing playback.
-        if live.lock.locked() or (self.auto_task and not self.auto_task.done()):
-            raise HTTPException(409, "当前动作正在结束，请稍候")
-        if live.replay:
-            raise HTTPException(409, "请先返回当前场景，再开始演示")
+        self.check_start(options.judge)
         if not live.next_action():
             raise HTTPException(409, "动作已结束，请重置场景")
-        if options.judge and self.backend.state != "ready":
-            raise HTTPException(409, "请等待模型就绪，或关闭动作后自动判断")
         live.delay, live.motion_speed = options.delay, options.motion_speed
         live.auto_judge = options.judge
+        live.pause_on_review = options.pause_on_review
         live.save_settings()
         live.auto_running, live.pause_reason = True, None
         self.wake.clear()
         self.auto_task = asyncio.create_task(self.autoplay())
         live.save()
         return live.snapshot()
+
+    async def demo(self, options):
+        """Reset and start as one event-loop operation; retain the previous report."""
+        live = self.live
+        self.validate(options)
+        if live.auto_running:
+            raise HTTPException(409, "请先暂停当前演示，再从头开始")
+        self.check_start(options.judge)
+        # No awaits between validation, reset and start: another tab cannot
+        # advance the fresh run before its single automatic executor is created.
+        live.reset(options.scenario)
+        fresh = options.model_copy(update={"run_id": live.id, "expected_revision": 0})
+        return await self.start(fresh)
 
     def pause(self, options):
         self.validate(options, revision=False)
@@ -534,6 +561,7 @@ class RobotController:
         self.live.delay, self.live.motion_speed = options.delay, options.motion_speed
         if not self.live.auto_running:
             self.live.auto_judge = options.judge
+            self.live.pause_on_review = options.pause_on_review
         self.live.save_settings()
         self.wake.set()
         self.live.save()
@@ -547,7 +575,7 @@ class RobotController:
                 if live.error:
                     live.pause_reason = "视觉请求未完成，演示已暂停"
                     break
-                if live.auto_judge and agreement(live.history[-1] if live.history else None) != "判断与场景一致":
+                if live.auto_judge and live.pause_on_review and agreement(live.history[-1] if live.history else None) != "判断与场景一致":
                     live.pause_reason = "模型判断需要复核，演示已暂停；可检查画面或手动执行"
                     break
                 if not live.next_action():
@@ -694,6 +722,10 @@ def install_routes(app, studio):
     @app.post("/api/robot/auto")
     async def auto(options: RobotPlayback):
         return await (await controller()).start(options)
+
+    @app.post("/api/robot/demo")
+    async def demo(options: RobotDemo):
+        return await (await controller()).demo(options)
 
     @app.post("/api/robot/pause")
     async def pause(options: RobotControl):

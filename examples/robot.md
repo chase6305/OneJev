@@ -26,6 +26,20 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 “重置场景”会重新载入当前案例。手动故障按钮仍可使用；手动注入同一预设故障后，
 脚本不会再重复注入。
 
+## 一键全自动
+
+选择案例后，直接点击“**一键全自动**”即可从初始场景运行到动作结束，不需要先载入
+或逐步确认。它会自动执行动作、注入预设故障并恢复；开启“动作后自动判断”时，每步
+还会获取固定相机画面、请求模型并保存结果。已有演示会保留为历史记录。
+
+这个入口会关闭“需要复核时暂停”。模型不确定或判断与场景验收不一致时，只记录原始
+结果，继续播放；结束后显示检查次数和需要复核的次数，不会把这些判断改成成功。
+如果不希望自动继续，可先暂停并勾选“需要复核时暂停”，再用工具栏的“自动演示”从当前
+动作继续。执行错误、相机或模型请求失败仍会暂停；暂停按钮始终可用。
+
+模型检查需要保留至少一个已连接的浏览器三维视图。全自动指演示流程自动运行，
+动作仍由预设技能与逆运动学执行，当前版本不包含模型自主规划或真机控制。
+
 三维视图中的原生设置面板默认收起，可点击“视图设置”显示或隐藏。“复位视角”只恢复
 本标签页的相机视角，“重连视图”只重新连接三维页面，两者都不会重置机械臂或推进动作。
 “放大三维视图”进入全屏；按 Escape 或点击退出全屏返回。手机端同样可以使用这些控制。
@@ -36,7 +50,8 @@ Viser 在首次打开机器人页时由 Studio 自动启动和关闭。三维页
 
 “让模型看一眼”只进行视觉判断，不执行任何动作。“自动演示”默认在每个技能之间
 停留 3 秒，可用滑块调整为 0.5–15 秒，动作速度可选 0.25–2 倍。暂停会在当前技能
-结束后生效。如果判断不确定、与场景验收冲突，或模型请求失败，自动演示会暂停。
+结束后生效。开启“需要复核时暂停”后，判断不确定或与场景验收冲突时会暂停。
+模型请求或执行失败始终会暂停。
 仍可手动检查画面和执行技能。若只想连续看完整动作，可先关闭“动作后自动判断”。
 
 自动演示由服务端统一推进。刷新页面、切换网站标签或关闭浏览器标签不会另开一轮演示，
@@ -122,6 +137,13 @@ and shifted-target placement; each fault remains a separate observable step. Vie
 settings start hidden on desktop and mobile. Camera reset, viewer reconnect and full
 screen operate on the view without resetting the robot. Temporary network failures
 disable scene controls until the current run has been synchronized again.
+
+Select a preset and click the one-click full demo to start a fresh run with no
+per-step confirmations. Actions, scheduled faults, recovery and enabled visual checks
+run automatically; uncertain/disagreeing predictions are recorded without pausing.
+Pause and enable pause-on-review for supervised playback from the current state. Execution,
+camera and inference errors still stop playback, and visual checks require a connected
+browser viewer. This automates the demonstration, not model-driven motion planning.
 
 OneJev receives a fixed-camera render and the task text, while scene acceptance is
 displayed independently. Model uncertainty and disagreement stay visible. This is a

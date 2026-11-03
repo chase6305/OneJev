@@ -81,6 +81,7 @@ window.OneJevRobot = (() => {
         "robot-auto",
         "robot-reset",
         "robot-load-scenario",
+        "robot-autostart",
         "robot-camera-reset",
         "robot-view-settings",
       ])
@@ -149,6 +150,10 @@ window.OneJevRobot = (() => {
     $("robot-shift").disabled = busy || auto || !!replay;
     $("robot-auto-judge").disabled = busy || auto || !!replay;
     if (!working) $("robot-auto-judge").checked = state.auto_judge;
+    $("robot-pause-review").disabled =
+      busy || auto || !!replay || !state.auto_judge;
+    if (!working)
+      $("robot-pause-review").checked = state.pause_on_review ?? true;
     $("robot-network-error").hidden = online;
     const shownCase = replay ? source?.scenario : state.scenario;
     $("robot-scenario").value = replay
@@ -156,6 +161,15 @@ window.OneJevRobot = (() => {
       : selectedScenario;
     $("robot-scenario").disabled = busy || auto || !!replay;
     $("robot-load-scenario").disabled = busy || auto || !!replay;
+    $("robot-autostart").disabled =
+      busy ||
+      auto ||
+      !!replay ||
+      !state.clients ||
+      (requireModel && !isReady());
+    $("robot-demo-hint").textContent = requireModel
+      ? "从头自动执行当前案例与视觉检查；不确定或有分歧的判断只记录，不暂停。"
+      : "从头自动执行当前案例与故障恢复，不调用模型。";
     $("robot-case-title").textContent =
       `${shownCase?.name || "自由演示"}${replay ? " · 正在回放历史" : ""}`;
     $("robot-case-description").textContent =
@@ -167,10 +181,13 @@ window.OneJevRobot = (() => {
     const actionCount = (state.events || []).filter(
       (item) => item.kind !== "reset",
     ).length;
+    const reviews = state.history.filter(
+      (item) => agreement(item) !== "判断与场景一致",
+    ).length;
     $("robot-case-progress").textContent = replay
       ? "返回当前场景后，可继续本次案例。"
       : state.phase === "complete"
-        ? `动作已完成 · 场景验收${state.truth.placed ? "通过" : "未通过"} · ${actionCount} 个动作/故障记录`
+        ? `动作已完成 · 场景验收${state.truth.placed ? "通过" : "未通过"} · ${actionCount} 个动作/故障记录${state.history.length ? ` · ${state.history.length} 次模型检查，${reviews} 次需复核` : ""}`
         : `${actionCount ? `刚刚：${lastEvent.label} · ` : "已准备 · "}下一步：${nextLabel || "结束"}${state.scenario?.fault_done ? " · 预设故障已发生" : state.scenario?.fault ? " · 包含一次预设故障" : ""}`;
     $("robot-camera-reset").disabled = !viewerReady || !state.clients;
     $("robot-view-settings").disabled = !viewerReady;
@@ -183,13 +200,17 @@ window.OneJevRobot = (() => {
       ? "回放不会调用模型或执行技能"
       : auto
         ? state.busy
-          ? "自动演示中 · 可随时暂停"
+          ? state.auto_judge && !state.pause_on_review
+            ? "全自动演示中 · 模型判断仅记录"
+            : "自动演示中 · 可随时暂停"
           : state.next_step_at
             ? `${Math.max(0, Math.ceil(state.next_step_at - Date.now() / 1000))} 秒后执行下一动作`
             : "正在开始演示…"
         : state.pause_reason ||
           (state.auto_judge
-            ? "开启自动判断 · 模型不确定时暂停"
+            ? state.pause_on_review
+              ? "开启自动判断 · 模型不确定时暂停"
+              : "全自动模式 · 复核判断保留在记录中"
             : "动作演示 · 可随时让模型看一眼");
     $("robot-replay-notice").hidden = !replay;
     $("robot-replay-label").textContent = replay
@@ -454,7 +475,15 @@ window.OneJevRobot = (() => {
     judge: $("robot-auto-judge").checked,
     delay: Number($("robot-delay").value),
     motion_speed: Number($("robot-speed").value),
+    pause_on_review: $("robot-pause-review").checked,
   });
+  $("robot-autostart").addEventListener("click", () =>
+    perform("demo", {
+      ...playbackOptions(),
+      scenario: selectedScenario,
+      pause_on_review: false,
+    }),
+  );
   $("robot-step").addEventListener("click", () =>
     perform("step", { judge: $("robot-auto-judge").checked }),
   );
@@ -464,6 +493,9 @@ window.OneJevRobot = (() => {
     perform(state?.auto_running ? "pause" : "auto", playbackOptions()),
   );
   $("robot-auto-judge").addEventListener("change", () =>
+    perform("settings", playbackOptions()),
+  );
+  $("robot-pause-review").addEventListener("change", () =>
     perform("settings", playbackOptions()),
   );
   $("robot-delay").addEventListener("input", () => {
