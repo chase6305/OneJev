@@ -128,6 +128,20 @@ EOF
 
 接口兼容 TypeSafe System One。更多示例：[视频](../examples/video.py)、[curl](../examples/curl.sh)、[官方 TypeSafe SDK](../examples/official_sdk.py)。
 
+### 统一交互网站
+
+[OneJev Studio](../examples/studio.md) 把浏览器任务、文本判断、图片理解和运行记录放在同一个本地网站里。
+支持单步执行、自动演示、暂停、速度调节和截图回放，最终结果会一直保留。
+
+```bash
+pip install -e '.[browser]'
+qev studio
+```
+
+打开 **http://127.0.0.1:7860**。系统安装了 Chrome 时会自动使用它，否则先运行
+`python -m playwright install chromium`。网站会复用已有模型服务，或自动启动本机 Flide。
+如果 GPU 推理使用独立环境，首次添加 `--inference-python /path/to/inference/python`，后续无需重复指定。
+
 ### 搭配 Playwright 做网页操作验证
 
 [浏览器验证示例](../examples/browser_verify.md#中文使用说明)将网页操作、截图、OneJev 判断和有限次数重试连接起来，

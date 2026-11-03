@@ -30,4 +30,4 @@ qev = "qev.cli:main"
 include = ["qev*"]
 
 [tool.setuptools.package-data]
-qev = ["playground/*.html"]
+qev = ["playground/*.html", "studio_assets/*.html", "studio_assets/*.css", "studio_assets/*.js"]

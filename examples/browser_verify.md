@@ -2,6 +2,9 @@
 
 [简体中文](#中文使用说明)
 
+For a persistent interactive website with manual steps, pause/resume, adjustable speed,
+text/image checks and screenshot history, use [OneJev Studio](studio.md): `qev studio`.
+
 This example connects a browser action to a model judgment and a bounded retry loop:
 
 ```text

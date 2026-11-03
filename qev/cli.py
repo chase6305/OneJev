@@ -152,6 +152,12 @@ def cmd_models(args: argparse.Namespace) -> None:
     print(json.dumps(Client(args.url).models(), indent=2))
 
 
+def cmd_studio(args: argparse.Namespace) -> None:
+    from .studio import run
+
+    run(args)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="qev", description="Open System One decision model and TypeSafe-compatible server")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -201,6 +207,12 @@ def main() -> None:
     m = sub.add_parser("models", help="list models of a running server")
     m.add_argument("--url", default=os.environ.get("QEV_BASE_URL", "http://localhost:8000"))
     m.set_defaults(func=cmd_models)
+
+    from .studio import add_arguments
+
+    studio = sub.add_parser("studio", help="start the interactive OneJev website")
+    add_arguments(studio)
+    studio.set_defaults(func=cmd_studio)
 
     args = p.parse_args()
     args.func(args)

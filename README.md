@@ -136,6 +136,22 @@ EOF
 The API is compatible with TypeSafe System One. More examples: [video](examples/video.py),
 [curl](examples/curl.sh), [official TypeSafe SDK](examples/official_sdk.py).
 
+### Interactive Studio
+
+[OneJev Studio](examples/studio.md) brings browser tasks, text checks, image checks and
+run history into one persistent local website. Step through a task manually, pause an
+automatic demonstration, adjust its speed and replay screenshots. Final results stay visible.
+
+```bash
+pip install -e '.[browser]'
+qev studio
+```
+
+Open **http://127.0.0.1:7860**. Installed Chrome is detected automatically; otherwise run
+`python -m playwright install chromium` first. Studio reuses a running model server or
+starts local Flide. If inference uses a different environment, pass
+`--inference-python /path/to/inference/python` once; Studio remembers it locally.
+
 ### Browser automation with Playwright
 
 The [browser verification example](examples/browser_verify.md) connects page actions,
