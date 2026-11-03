@@ -44,6 +44,12 @@ python examples/browser_verify.py --base-url http://127.0.0.1:8000 --channel chr
 `QEV_BASE_URL` and `TYPESAFE_BASE_URL` are also supported by the client. `--model`
 accepts the server's model name or an alias; its default is `jev-latest`.
 
+If the example reports `Cannot reach model server` or `Connection refused`, check
+`curl http://127.0.0.1:8000/health`. The browser environment and model server are
+separate processes: activating `.venv` does not start the model server. Keep the
+server terminal running, or run it under your usual process manager. Start Flide
+with the Python environment that has the GPU inference dependencies installed.
+
 ## Local scenarios
 
 ```bash
@@ -170,6 +176,10 @@ python examples/browser_verify.py
 ```bash
 python examples/browser_verify.py --channel chrome
 ```
+
+出现 `Connection refused` 或 `Cannot reach model server` 时，先用
+`curl http://127.0.0.1:8000/health` 检查模型服务。激活浏览器示例的 `.venv`
+不会启动模型服务；需要在装有 GPU 推理依赖的环境中另开终端运行 Flide，并保持该进程运行。
 
 默认 `retry` 场景会经历“未付款 → 临时失败 → 重试 → 付款成功”。其他场景：
 

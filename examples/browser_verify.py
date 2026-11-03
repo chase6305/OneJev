@@ -307,7 +307,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if decision.action == "verified" else 1
     except HTTPError as exc:
         reason = f"Model server returned HTTP {exc.code}: {exc.read(2000).decode('utf-8', errors='replace')}"
-    except (URLError, TimeoutError, OSError, ValueError, KeyError, TypeError, PlaywrightError) as exc:
+    except URLError as exc:
+        reason = (f"Cannot reach model server at {client.base_url}: {exc.reason}. "
+                  "Start the model server in its inference environment, or select a running endpoint with --base-url.")
+    except (TimeoutError, OSError, ValueError, KeyError, TypeError, PlaywrightError) as exc:
         reason = f"{type(exc).__name__}: {exc}"
     except KeyboardInterrupt:
         recorder.finish("interrupted", "Run interrupted.", settings=settings)

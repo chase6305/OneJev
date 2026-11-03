@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,8 @@ class BrowserIntegrationTests(unittest.TestCase):
             reports = list(Path(temp).glob("*/report.json"))
             self.assertEqual(len(reports), 1, process.stdout + process.stderr)
             report = json.loads(reports[0].read_text())
+            if report["result"] == "error":
+                self.assertTrue((reports[0].parent / "error.png").is_file())
             for observation in report["observations"]:
                 self.assertTrue((reports[0].parent / observation["screenshot"]).is_file())
             for request in self.server.requests:
@@ -143,6 +146,16 @@ class BrowserIntegrationTests(unittest.TestCase):
                                "--wait-for", "#missing-element", expected_code=2)
         self.assertEqual(report["result"], "error")
         self.assertIn("Locator.wait_for", report["reason"])
+        self.assertEqual(self.server.requests, [])
+
+    def test_unavailable_model_server_reports_endpoint_and_recovery(self):
+        with socket.socket() as unused:
+            unused.bind(("127.0.0.1", 0))
+            endpoint = f"http://127.0.0.1:{unused.getsockname()[1]}"
+            report = self.run_case([], "--base-url", endpoint, expected_code=2)
+        self.assertEqual(report["result"], "error")
+        self.assertIn(endpoint, report["reason"])
+        self.assertIn("Start the model server", report["reason"])
         self.assertEqual(self.server.requests, [])
 
 
