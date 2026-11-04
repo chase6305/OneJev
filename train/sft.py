@@ -599,7 +599,6 @@ def main(argv=None) -> int:
         common.block_fla_kernels()
 
     import torch
-    from transformers import get_cosine_schedule_with_warmup
 
     if world > 1:
         import torch.distributed as dist
@@ -636,6 +635,8 @@ def main(argv=None) -> int:
                                 load_model=not args.plan_only)
     if args.plan_only:
         return plan_only(bundle, rows, args, world)
+    from transformers import get_cosine_schedule_with_warmup
+
     log.info("model_type=%s template_kwargs=%s", bundle.model_type, bundle.template_kwargs)
 
     if args.full_finetune:

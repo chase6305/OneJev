@@ -21,8 +21,6 @@ dependencies = [
 [project.optional-dependencies]
 browser = ["playwright>=1.49"]
 robot = ["viser>=1.1.1,<2", "scipy>=1.12", "playwright>=1.49"]
-
-
 dev = [
   "pytest>=8,<9; python_version < '3.11'",
   "pytest>=8; python_version >= '3.11'",
