@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -173,6 +173,7 @@ class Studio:
         self.playwright = None
         self.browser = None
         self.browser_lock = asyncio.Lock()
+        self.session_lock = asyncio.Lock()
         self.close_robot = None
 
     async def get_browser(self):
@@ -198,27 +199,39 @@ class Studio:
             return self.browser
 
     async def create_session(self, scenario: str) -> Session:
-        if len(self.sessions) >= 8:
-            for key, old in list(self.sessions.items()):
-                if not old.auto_running and not old.lock.locked():
-                    await old.page.close()
-                    del self.sessions[key]
-                    break
-            else:
-                raise HTTPException(409, "当前运行中的案例过多，请先暂停一个案例")
-        browser = await self.get_browser()
-        session = Session(scenario, self.config.output)
-        session.page = await browser.new_page(viewport={"width": 1280, "height": 720}, device_scale_factor=1)
-        session.page.set_default_timeout(5000)
-        try:
-            await session.page.goto(ASSETS.joinpath("invoice.html").as_uri() + f"?scenario={scenario}")
-            await session.page.screenshot(path=str(session.path / session.frame), animations="disabled")
-        except Exception:
-            await session.page.close()
-            raise
-        self.sessions[session.id] = session
-        session.save()
-        return session
+        # Admission and browser allocation must share a lock: concurrent requests
+        # otherwise all see free capacity before their first page is registered.
+        async with self.session_lock:
+            if len(self.sessions) >= 8:
+                for key, old in list(self.sessions.items()):
+                    if not old.auto_running and not old.lock.locked():
+                        async with old.lock:
+                            del self.sessions[key]
+                            # Disconnected browsers may reject close; saved reports
+                            # remain available even after the live page is evicted.
+                            with suppress(Exception):
+                                await old.page.close()
+                        break
+                else:
+                    raise HTTPException(409, "当前运行中的案例过多，请先暂停一个案例")
+            browser = await self.get_browser()
+            session = Session(scenario, self.config.output)
+            try:
+                session.page = await browser.new_page(viewport={"width": 1280, "height": 720}, device_scale_factor=1)
+                session.page.set_default_timeout(5000)
+                await session.page.goto(ASSETS.joinpath("invoice.html").as_uri() + f"?scenario={scenario}")
+                await session.page.screenshot(path=str(session.path / session.frame), animations="disabled")
+                session.save()
+            except BaseException:
+                # Cancellation must release resources too, including failures that
+                # happen before navigation or while writing the initial report.
+                if session.page is not None:
+                    with suppress(Exception):
+                        await session.page.close()
+                shutil.rmtree(session.path, ignore_errors=True)
+                raise
+            self.sessions[session.id] = session
+            return session
 
     def session(self, identifier: str) -> Session:
         if identifier not in self.sessions:
