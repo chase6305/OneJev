@@ -1,12 +1,15 @@
 """Model service ownership and persistent Studio artifacts, without a GPU."""
+import asyncio
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.error import URLError
+
+from fastapi import HTTPException
 
 from qev.studio import Backend, Config, Session, Studio
 
@@ -72,8 +75,79 @@ class PersistenceTests(unittest.TestCase):
             self.assertFalse((session.path / "report.tmp").exists())
 
 
+class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_creation_bounds_pages_and_keeps_evicted_reports(self):
+        pages = []
+
+        async def new_page(**kwargs):
+            await asyncio.sleep(0)
+            page = Mock(goto=AsyncMock(), screenshot=AsyncMock(), close=AsyncMock())
+            pages.append(page)
+            return page
+
+        with tempfile.TemporaryDirectory() as root:
+            studio = Studio(Config(output=Path(root)))
+            with patch.object(studio, "get_browser", AsyncMock(return_value=Mock(new_page=new_page))):
+                sessions = await asyncio.gather(*(studio.create_session("retry") for _ in range(12)))
+            self.assertEqual(len(studio.sessions), 8)
+            self.assertEqual(sum(not page.close.await_count for page in pages), 8)
+            for session in sessions:
+                self.assertTrue((session.path / "report.json").is_file())
+
+    async def test_active_cases_are_not_evicted_when_capacity_is_reached(self):
+        with tempfile.TemporaryDirectory() as root:
+            studio = Studio(Config(output=Path(root)))
+            for index in range(8):
+                session = Session("retry", Path(root))
+                session.page = Mock(close=AsyncMock())
+                session.auto_running = index % 2 == 0
+                if not session.auto_running:
+                    await session.lock.acquire()
+                studio.sessions[session.id] = session
+            with self.assertRaises(HTTPException) as error:
+                await studio.create_session("success")
+            self.assertEqual(error.exception.status_code, 409)
+            for session in studio.sessions.values():
+                session.page.close.assert_not_awaited()
+
+    async def test_failed_or_cancelled_creation_releases_page_and_partial_files(self):
+        for stage in ("new_page", "goto", "screenshot", "save", "cancel"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as root:
+                studio = Studio(Config(output=Path(root)))
+                page = Mock(goto=AsyncMock(), screenshot=AsyncMock(), close=AsyncMock())
+                browser = Mock(new_page=AsyncMock(return_value=page))
+                error = asyncio.CancelledError() if stage == "cancel" else RuntimeError("creation failed")
+                if stage == "new_page":
+                    browser.new_page.side_effect = error
+                elif stage != "save":
+                    getattr(page, "goto" if stage == "cancel" else stage).side_effect = error
+                with patch.object(studio, "get_browser", AsyncMock(return_value=browser)), \
+                        patch.object(Session, "save", side_effect=error if stage == "save" else None):
+                    with self.assertRaises(type(error)):
+                        await studio.create_session("retry")
+                self.assertEqual(studio.sessions, {})
+                self.assertEqual(list(Path(root).iterdir()), [])
+                if stage != "new_page":
+                    page.close.assert_awaited_once()
+
+
 @unittest.skipUnless(os.environ.get("QEV_BROWSER_TESTS") == "1", "set QEV_BROWSER_TESTS=1 to check browser recovery")
 class BrowserRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_cases_keep_at_most_eight_real_browser_contexts(self):
+        with tempfile.TemporaryDirectory() as root:
+            studio = Studio(Config(output=Path(root), channel=os.environ.get("QEV_BROWSER_CHANNEL")))
+            try:
+                sessions = await asyncio.gather(*(studio.create_session("retry") for _ in range(12)))
+                self.assertEqual(len(studio.sessions), 8)
+                self.assertEqual(len(studio.browser.contexts), 8)
+                for session in sessions:
+                    self.assertTrue((session.path / "report.json").is_file())
+                for session in studio.sessions.values():
+                    self.assertFalse(session.page.is_closed())
+                    self.assertTrue((session.path / "preview.png").is_file())
+            finally:
+                await studio.close()
+
     async def test_closed_browser_is_recreated_for_the_next_case(self):
         with tempfile.TemporaryDirectory() as root:
             studio = Studio(Config(output=Path(root), channel=os.environ.get("QEV_BROWSER_CHANNEL")))

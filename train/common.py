@@ -22,7 +22,11 @@ KINDS = ("noul", "choice", "score")
 
 
 def load_rows(path: str | Path, limit: int | None = None, split: str | None = None) -> list[dict]:
-    """Read the unified JSONL example format of DESIGN.md 4.1."""
+    """Read unified JSONL examples, optionally filtering the split and limiting the row count."""
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative or None")
+    if limit == 0:
+        return []
     rows: list[dict] = []
     with open(path, "r", encoding="utf-8") as fh:
         for line in fh:
@@ -54,6 +58,8 @@ def target_vector(target: dict[str, float], labels: Sequence[str]) -> list[float
     """Target probabilities in slot order. Labels come from the rendered question, so a permuted
     rendering permutes the target for free."""
     vec = [float(target.get(lbl, 0.0)) for lbl in labels]
+    if any(not math.isfinite(v) or v < 0 for v in vec):
+        raise ValueError("target probabilities must be finite and non-negative")
     total = sum(vec)
     if total <= 0:
         raise ValueError(f"target {target} has no mass on the rendered labels {list(labels)}")
@@ -141,6 +147,8 @@ def pad_options(row: dict, pool: dict, prob: float, seed: int, char_budget: int 
         return q
     crit = dict(q["criteria"])
     k0 = len(crit)
+    if k0 >= PAD_MAX_OPTIONS:
+        return q
     target_k = rng.randint(max(k0 + 1, 27), PAD_MAX_OPTIONS)
     budget = char_budget
     for _ in range(4 * target_k):
@@ -363,9 +371,6 @@ def short_names(paths: Sequence[str]) -> list[str]:
     return sorted({p.split(".")[-1] for p in paths})
 
 
-_TENSOR_KEEP = True
-
-
 def readout_logits(model, input_ids, attention_mask, ends):
     """Full-vocabulary logits at each row's last real token, under RIGHT padding.
 
@@ -374,18 +379,16 @@ def readout_logits(model, input_ids, attention_mask, ends):
     position_ids (arange) are already correct for every real token. Left padding would shift the
     positions of the real tokens, which is why it is not used here.
 
-    We never materialise [B, T, V]. The primary path passes `logits_to_keep` as a tensor of the
-    distinct readout positions, exactly like qev.engine._run_batched. If a model rejects the
-    tensor form, we fall back to an integer tail width, which every implementation supports and
-    which is just as cheap because batches are length-sorted.
+    The primary path passes `logits_to_keep` as a tensor of the distinct readout positions,
+    exactly like qev.engine._run_batched. If a model rejects the tensor form, only that model
+    uses the integer-tail fallback. An allocation failure is propagated to the caller.
     """
     import torch
 
-    global _TENSOR_KEEP
     bsz, seqlen = input_ids.shape
     ends = [int(e) for e in ends]
     rows = torch.arange(bsz, device=input_ids.device)
-    if _TENSOR_KEEP:
+    if getattr(model, "_qev_tensor_logits_to_keep", True):
         keep = sorted(set(ends))
         try:
             ltk = torch.tensor(keep, dtype=torch.long, device=input_ids.device)
@@ -393,8 +396,10 @@ def readout_logits(model, input_ids, attention_mask, ends):
                         return_dict=True, logits_to_keep=ltk)
             pos = torch.tensor([keep.index(e) for e in ends], dtype=torch.long, device=input_ids.device)
             return out.logits[rows, pos]
+        except torch.OutOfMemoryError:
+            raise
         except Exception as exc:
-            _TENSOR_KEEP = False
+            model._qev_tensor_logits_to_keep = False
             log.warning("tensor logits_to_keep unavailable (%s); using integer tail width", exc)
     width = seqlen - min(ends)
     out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False,
@@ -478,17 +483,27 @@ def load_yaml_config(path: str | Path) -> dict:
     import yaml
 
     with open(path, "r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
+        data = yaml.safe_load(fh)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: configuration must be a mapping of option names to values")
     out = {}
     for k, v in data.items():
         key = str(k).replace("-", "_")
-        out[CONFIG_ALIASES.get(key, key)] = v
+        key = CONFIG_ALIASES.get(key, key)
+        if key in out:
+            raise ValueError(f"{path}: duplicate configuration option {key!r}")
+        out[key] = v
     return out
 
 
 def apply_config(parser, path: str | Path) -> None:
     """Load a YAML config as argparse defaults. Unknown keys are an error, not a silent no-op."""
-    cfg = load_yaml_config(path)
+    try:
+        cfg = load_yaml_config(path)
+    except ValueError as exc:
+        parser.error(str(exc))
     known = {a.dest for a in parser._actions}
     unknown = sorted(set(cfg) - known)
     if unknown:
