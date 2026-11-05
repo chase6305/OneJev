@@ -108,7 +108,8 @@ class Client:
             body["media"] = media
         data, headers = self._post(path, body)
         return Response(model=data["model"], answers={k: _Answer(v) for k, v in data["answers"].items()},
-                        usage=data.get("usage", {}), request_id=headers.get("x-typesafe-request-id"), meta=data.get("qev", {}))
+                        usage=data.get("usage", {}), request_id=headers.get("x-typesafe-request-id"),
+                        meta=data.get("qev", data.get("onejev", {})))
 
     def models(self) -> list[dict[str, Any]]:
         return self._get("/v1/models")["models"]

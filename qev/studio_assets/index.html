@@ -1,0 +1,675 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#123c36" />
+    <title>OneJev Studio · 交互实验室</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+    <script src="/assets/app.js" defer></script>
+    <script src="/assets/robot.js" defer></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="OneJev Studio 首页"
+        ><span class="brand-mark">O<span>J</span></span
+        ><span>OneJev<small>STUDIO</small></span></a
+      >
+      <div class="nav-label">交互实验室</div>
+      <nav aria-label="案例导航">
+        <button class="nav-item active" data-tab="browser">
+          <span class="nav-icon">▣</span>浏览器任务<span class="nav-number"
+            >01</span
+          >
+        </button>
+        <button class="nav-item" data-tab="text">
+          <span class="nav-icon">≡</span>文本判断<span class="nav-number"
+            >02</span
+          >
+        </button>
+        <button class="nav-item" data-tab="image">
+          <span class="nav-icon">▧</span>图片理解<span class="nav-number"
+            >03</span
+          >
+        </button>
+        <button class="nav-item" data-tab="robot">
+          <span class="nav-icon">⌁</span>机器人动作<span class="nav-number"
+            >04</span
+          >
+        </button>
+        <button class="nav-item" data-tab="runs">
+          <span class="nav-icon">↺</span>运行记录
+        </button>
+      </nav>
+      <div class="sidebar-note">
+        <span class="tiny-dot"></span> 所有案例，一个入口
+        <p>模型在本机运行。<br />按自己的节奏，观察每一次判断。</p>
+      </div>
+      <div class="sidebar-footer">ONEJEV 1.6 <span>LOCAL</span></div>
+    </aside>
+    <div class="app">
+      <header class="topbar">
+        <div class="breadcrumb">
+          Workspace <span>/</span> <strong id="breadcrumb">浏览器任务</strong>
+        </div>
+        <div class="connection">
+          <span class="status-dot" id="model-dot"></span
+          ><span id="model-state" role="status">正在连接模型…</span
+          ><button class="link-button" id="reconnect">重新连接</button>
+        </div>
+      </header>
+      <main>
+        <section
+          class="tab-panel"
+          id="panel-browser"
+          aria-labelledby="browser-title"
+        >
+          <div class="page-heading">
+            <div>
+              <div class="eyebrow">01 / BROWSER DECISIONS</div>
+              <h1 id="browser-title">看清每一步，再继续。</h1>
+              <p>观察网页、理解状态、决定下一步。让模型判断在你眼前发生。</p>
+            </div>
+            <span class="local-label"
+              ><span class="tiny-dot"></span> 本地模拟案例</span
+            >
+          </div>
+          <div class="toolbar card">
+            <label class="scenario-label"
+              >案例<select id="scenario">
+                <option value="retry">付款失败 → 自动重试</option>
+                <option value="success">首次付款成功</option>
+                <option value="blocked">付款被拒绝 → 人工检查</option>
+                <option value="exhausted">持续失败 → 达到上限</option>
+                <option value="pending">一直处理中 → 等待</option>
+              </select></label
+            >
+            <div class="toolbar-actions">
+              <button class="primary" id="auto">▶ 自动演示</button
+              ><button class="secondary" id="step">单步判断</button
+              ><button class="secondary" id="pause" hidden>Ⅱ 暂停</button
+              ><button
+                class="secondary"
+                id="reset"
+                title="重新开始"
+                aria-label="重新开始"
+              >
+                ↻ 重新开始
+              </button>
+            </div>
+            <label class="speed-label" for="speed"
+              >每步停留 <strong id="speed-label">3 秒</strong
+              ><input
+                id="speed"
+                type="range"
+                min="0.5"
+                max="10"
+                value="3"
+                step="0.5"
+                aria-label="每步停留秒数"
+            /></label>
+          </div>
+          <div class="workspace">
+            <div class="visual-column">
+              <div class="browser-shell card">
+                <div class="browser-chrome">
+                  <div class="traffic"><i></i><i></i><i></i></div>
+                  <span class="address">ACME / invoice / INV-1042</span
+                  ><span id="page-badge" class="badge">等待开始</span>
+                </div>
+                <div class="frame-wrap">
+                  <img
+                    id="frame"
+                    alt="当前案例网页截图，点击可放大"
+                    tabindex="0"
+                  />
+                  <div class="frame-empty" id="frame-empty">
+                    <span class="loader"></span>正在准备案例页面…
+                  </div>
+                  <div class="thinking" id="thinking" hidden>
+                    <span class="loader"></span>模型正在观察截图
+                  </div>
+                </div>
+                <div class="frame-footer">
+                  <span id="frame-caption">真实浏览器截图 · 点击放大</span
+                  ><span id="frame-size">1280 × 720</span>
+                </div>
+              </div>
+              <div class="section-row">
+                <h2>观察轨迹 <span id="step-count">0 步</span></h2>
+                <span class="muted"
+                  >点击任意一步回看
+                  <button class="link-button" id="latest-frame" hidden>
+                    返回最新
+                  </button></span
+                >
+              </div>
+              <div class="timeline" id="timeline">
+                <div class="empty-line">点击「单步判断」，开始第一次观察。</div>
+              </div>
+            </div>
+            <aside class="decision-card card">
+              <div class="card-eyebrow">
+                <span class="tiny-dot"></span> 模型判断
+                <span id="result-badge" class="badge">等待观察</span>
+              </div>
+              <div class="probability-label">任务已完成的概率</div>
+              <div class="probability">
+                <span id="done-value">—</span><small>%</small>
+              </div>
+              <div class="probability-track"><div id="done-fill"></div></div>
+              <p class="probability-hint" id="done-hint">
+                截图中的信息会成为模型的判断依据。
+              </p>
+              <div class="decision-divider"></div>
+              <div class="detail-row state-row">
+                <span>当前状态</span><strong id="state-value">尚未判断</strong>
+              </div>
+              <div class="detail-row confidence-row">
+                <span>状态概率</span><strong id="confidence-value">—</strong>
+              </div>
+              <div class="detail-row latency-row">
+                <span>本次耗时</span><strong id="time-value">—</strong>
+              </div>
+              <div class="next-action">
+                <small>下一步</small
+                ><strong id="next-action">等待你的指令</strong>
+                <p id="action-description">
+                  单步模式下，下一次点击才执行建议的动作。
+                </p>
+                <p id="auto-countdown" class="auto-countdown" hidden></p>
+              </div>
+              <div
+                id="session-error"
+                class="inline-error"
+                role="alert"
+                hidden
+              ></div>
+              <details class="raw-details">
+                <summary>查看原始结果</summary>
+                <pre id="raw-result">暂无结果</pre>
+              </details>
+            </aside>
+          </div>
+          <div class="bottom-note">
+            <span>↳</span>
+            模型读取截图，浏览器执行动作；页面真实状态用于核对结果。案例不会发起真实付款。
+          </div>
+        </section>
+
+        <section
+          class="tab-panel"
+          id="panel-robot"
+          hidden
+          aria-labelledby="robot-title"
+        >
+          <div class="page-heading">
+            <div>
+              <div class="eyebrow">04 / ROBOT ACTIONS · VISER</div>
+              <h1 id="robot-title">让动作看得见，也能被检查。</h1>
+              <p>
+                把红色方块放入蓝色托盘。三维操作、相机画面和模型判断，在同一个页面里。
+              </p>
+            </div>
+            <span class="local-label">运动学演示 · 非物理仿真</span>
+          </div>
+          <div class="card robot-case">
+            <div class="robot-case-picker">
+              <label for="robot-scenario">选择一个案例</label>
+              <select id="robot-scenario">
+                <option value="normal">01 · 正常抓放</option>
+                <option value="miss">02 · 抓空后重试</option>
+                <option value="drop">03 · 掉落后恢复</option>
+                <option value="shift">04 · 目标移动</option>
+              </select>
+              <button id="robot-load-scenario" class="secondary">
+                载入案例
+              </button>
+              <button id="robot-autostart" class="primary">
+                ▶ 一键全自动
+              </button>
+              <div class="robot-sequence-options">
+                <label for="robot-sequence">播放范围</label>
+                <select id="robot-sequence">
+                  <option value="current">当前案例</option>
+                  <option value="all">四个案例依次播放</option>
+                </select>
+                <label for="robot-rounds">轮数</label
+                ><input
+                  id="robot-rounds"
+                  type="number"
+                  min="1"
+                  max="20"
+                  value="1"
+                />
+              </div>
+              <small id="robot-demo-hint"
+                >从头自动执行当前案例，模型判断仅记录，不因复核结论暂停。</small
+              >
+            </div>
+            <div class="robot-case-guide">
+              <strong id="robot-case-title">正常抓放</strong>
+              <p id="robot-case-description">
+                载入后可逐步执行或自动演示，故障会在预设时机出现。
+              </p>
+              <span id="robot-case-progress" role="status">从初始场景开始</span>
+            </div>
+          </div>
+          <div
+            id="robot-network-error"
+            class="inline-error"
+            role="alert"
+            hidden
+          >
+            无法连接工作台，操作已暂时禁用。自动演示可能仍在服务端继续，连接恢复后可暂停。
+          </div>
+          <div class="toolbar card robot-toolbar">
+            <button class="primary" id="robot-step">执行：靠近方块</button
+            ><button class="secondary" id="robot-observe">让模型看一眼</button
+            ><button class="secondary" id="robot-auto">▶ 自动演示</button
+            ><button class="secondary" id="robot-reset">↻ 重置场景</button>
+            <button class="secondary" id="robot-stop-playlist" disabled>
+              结束连播
+            </button>
+            <div class="robot-checks">
+              <label class="robot-check"
+                ><input
+                  type="checkbox"
+                  id="robot-auto-judge"
+                  checked
+                />动作后自动判断</label
+              ><label class="robot-check"
+                ><input
+                  type="checkbox"
+                  id="robot-pause-review"
+                  checked
+                />需要复核时暂停</label
+              >
+            </div>
+          </div>
+          <div class="card robot-playback">
+            <label for="robot-delay"
+              >动作间停留 <output id="robot-delay-value">3 秒</output></label
+            >
+            <input
+              id="robot-delay"
+              type="range"
+              min="0.5"
+              max="15"
+              step="0.5"
+              value="3"
+              aria-label="动作间停留秒数"
+            />
+            <label for="robot-speed">动作速度</label>
+            <select id="robot-speed" aria-label="动作速度">
+              <option value="0.25">0.25 ×</option>
+              <option value="0.5">0.5 ×</option>
+              <option value="1" selected>1 ×</option>
+              <option value="1.5">1.5 ×</option>
+              <option value="2">2 ×</option>
+            </select>
+            <span id="robot-playback-status" role="status"
+              >逐步执行，随时观察</span
+            >
+          </div>
+          <div class="card robot-playlist" id="robot-playlist" hidden>
+            <div class="section-row">
+              <h2>连播进度与记录</h2>
+              <div class="robot-run-tools">
+                <select id="robot-playlist-select" aria-label="连播记录">
+                  <option value="">当前连播</option>
+                </select>
+                <a
+                  id="robot-playlist-report"
+                  class="link-button"
+                  download="robot-playlist.json"
+                  >导出汇总</a
+                >
+              </div>
+            </div>
+            <p id="robot-playlist-status" role="status"></p>
+            <div class="robot-playlist-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>轮 / 案例</th>
+                    <th>状态</th>
+                    <th>检查 / 复核 / 请求异常</th>
+                    <th>记录</th>
+                  </tr>
+                </thead>
+                <tbody id="robot-playlist-rows"></tbody>
+              </table>
+            </div>
+          </div>
+          <div id="robot-replay-notice" class="card robot-replay-notice" hidden>
+            <div>
+              <strong>历史姿态回放</strong>
+              <p id="robot-replay-label">仅显示记录，不执行动作。</p>
+            </div>
+            <button id="robot-live" class="secondary">返回当前场景</button>
+          </div>
+          <div class="robot-workspace">
+            <div class="robot-visual">
+              <div class="card robot-viewer">
+                <div class="browser-chrome">
+                  <span class="tiny-dot"></span
+                  ><span class="address">Viser · 六轴机械臂与平行夹爪</span
+                  ><span class="badge" id="robot-phase">正在准备场景</span>
+                </div>
+                <div class="robot-view-tools">
+                  <button id="robot-camera-reset" class="link-button">
+                    复位视角
+                  </button>
+                  <button
+                    id="robot-view-settings"
+                    class="link-button"
+                    aria-expanded="false"
+                  >
+                    视图设置
+                  </button>
+                  <button id="robot-view-reconnect" class="link-button">
+                    重连视图
+                  </button>
+                  <button id="robot-fullscreen" class="link-button">
+                    放大三维视图
+                  </button>
+                </div>
+                <iframe
+                  id="robot-viewer"
+                  title="Viser 机器人三维交互视图"
+                  allow="fullscreen"
+                  loading="lazy"
+                ></iframe>
+                <div class="frame-footer">
+                  <span>左键旋转 · 右键平移 · 滚轮缩放</span
+                  ><span id="robot-connection">正在连接三维视图…</span>
+                </div>
+              </div>
+              <div class="robot-faults card">
+                <span>尝试故障</span
+                ><button class="secondary" id="robot-miss">下一次抓空</button
+                ><button class="secondary" id="robot-drop">让方块掉落</button
+                ><button class="secondary" id="robot-shift">移动目标托盘</button
+                ><small id="robot-fault-hint"
+                  >先看正常流程，再观察失败时的判断。</small
+                >
+              </div>
+              <div class="section-row robot-run-row">
+                <h2>动作与故障轨迹</h2>
+                <div class="robot-run-tools">
+                  <select id="robot-run" aria-label="机器人演示记录">
+                    <option value="">当前演示</option>
+                  </select>
+                  <button
+                    id="robot-runs-refresh"
+                    class="link-button"
+                    title="刷新演示记录"
+                  >
+                    刷新
+                  </button>
+                  <a
+                    id="robot-report"
+                    class="link-button"
+                    download="robot-report.json"
+                    >导出 JSON</a
+                  >
+                </div>
+              </div>
+              <div
+                id="robot-events"
+                class="timeline"
+                aria-label="点击记录回看三维姿态"
+              ></div>
+              <div class="section-row">
+                <h2>模型实际看到的画面</h2>
+                <span id="robot-camera-label" class="muted"
+                  >固定相机 · 与自由视角独立</span
+                >
+              </div>
+              <div class="card robot-camera">
+                <img
+                  id="robot-camera"
+                  alt="发送给 OneJev 的固定相机画面"
+                  hidden
+                />
+                <div id="robot-camera-empty" class="answer-empty">
+                  <span>▧</span>
+                  <p id="robot-camera-empty-message">
+                    点击「让模型看一眼」，获取固定相机画面并作判断。
+                  </p>
+                </div>
+              </div>
+              <p id="robot-capture-mode" class="muted">相机待机</p>
+              <div class="section-row">
+                <h2>视觉检查记录</h2>
+                <button id="robot-latest" class="link-button" hidden>
+                  返回当前场景
+                </button>
+              </div>
+              <div id="robot-history" class="timeline">
+                <div class="empty-line">还没有视觉检查记录。</div>
+              </div>
+              <details
+                id="robot-check-errors"
+                class="card robot-check-errors"
+                hidden
+              >
+                <summary id="robot-check-errors-summary">
+                  视觉请求异常记录
+                </summary>
+                <div id="robot-check-errors-list"></div>
+              </details>
+            </div>
+            <aside class="card robot-results">
+              <div class="card-eyebrow">
+                <span class="tiny-dot"></span>视觉判断<span
+                  class="badge"
+                  id="robot-verdict"
+                  >等待观察</span
+                >
+              </div>
+              <div class="robot-prob">
+                <span>方块已放进托盘并释放</span
+                ><strong id="robot-placed">—<small>%</small></strong>
+                <div class="probability-track">
+                  <div id="robot-placed-fill"></div>
+                </div>
+              </div>
+              <div class="robot-prob">
+                <span>夹住方块且已离开桌面</span
+                ><strong id="robot-grasped">—<small>%</small></strong>
+                <div class="probability-track">
+                  <div id="robot-grasped-fill"></div>
+                </div>
+              </div>
+              <div class="decision-divider"></div>
+              <div class="card-eyebrow">独立场景验收</div>
+              <div class="detail-row">
+                <span>夹持并离桌</span
+                ><strong id="robot-truth-grasped">否</strong>
+              </div>
+              <div class="detail-row">
+                <span>放进托盘并释放</span
+                ><strong id="robot-truth-placed">否</strong>
+              </div>
+              <div class="detail-row">
+                <span>本次模型耗时</span><strong id="robot-time">—</strong>
+              </div>
+              <div class="detail-row">
+                <span>本次截图耗时</span
+                ><strong id="robot-capture-time">—</strong>
+              </div>
+              <div class="next-action">
+                <small>脚本的下一动作</small
+                ><strong id="robot-next">靠近方块</strong>
+                <p>
+                  动作由预设技能与逆运动学执行。OneJev 读取相机图像作结果检查。
+                </p>
+              </div>
+              <p class="robot-note">
+                场景验收来自物体位置与演示夹持状态，独立于模型结果。这里不模拟接触力、摩擦或真实抓取稳定性。
+              </p>
+              <div
+                id="robot-error"
+                class="inline-error"
+                hidden
+                role="alert"
+              ></div>
+              <details class="raw-details">
+                <summary>查看模型原始结果</summary>
+                <pre id="robot-raw">暂无结果</pre>
+              </details>
+            </aside>
+          </div>
+        </section>
+        <section
+          class="tab-panel"
+          id="panel-text"
+          hidden
+          aria-labelledby="text-title"
+        >
+          <div class="page-heading">
+            <div>
+              <div class="eyebrow">02 / TEXT DECISIONS</div>
+              <h1 id="text-title">一段话，几个明确的判断。</h1>
+              <p>修改文本，观察团队分流、紧急程度与任务完成概率如何变化。</p>
+            </div>
+          </div>
+          <div class="input-workspace">
+            <form id="text-form" class="input-card card">
+              <label
+                >选择任务<select id="text-preset">
+                  <option value="support">客服分流与紧急程度</option>
+                  <option value="completion">任务完成检查</option>
+                </select></label
+              ><label
+                >输入文本<textarea id="text-input" rows="8">
+我的订阅这个月被扣了两次款，请尽快帮我退还多扣的一笔，我已经等了三天了。</textarea
+                ></label
+              ><label id="text-statement-wrap" hidden
+                >要判断的命题<input
+                  id="text-statement"
+                  value="用户的问题已经解决。"
+              /></label>
+              <div class="sample-buttons">
+                <span>试试：</span
+                ><button type="button" data-text-sample="refund">
+                  重复扣款</button
+                ><button type="button" data-text-sample="bug">软件故障</button
+                ><button type="button" data-text-sample="resolved">
+                  问题已解决
+                </button>
+              </div>
+              <button class="primary wide" id="text-submit" type="submit">
+                判断这段文本 <span>↗</span>
+              </button>
+            </form>
+            <div class="answers-card card">
+              <div class="card-eyebrow">判断结果</div>
+              <div id="text-answers" class="answer-output">
+                <div class="answer-empty">
+                  <span>≡</span>
+                  <h3>从一个真实问题开始</h3>
+                  <p>输入内容，模型会返回各个选项的概率。</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section
+          class="tab-panel"
+          id="panel-image"
+          hidden
+          aria-labelledby="image-title"
+        >
+          <div class="page-heading">
+            <div>
+              <div class="eyebrow">03 / VISUAL DECISIONS</div>
+              <h1 id="image-title">给它一张图，问一个问题。</h1>
+              <p>上传截图或照片，用一句话描述你想确认的状态。</p>
+            </div>
+          </div>
+          <div class="input-workspace">
+            <form id="image-form" class="input-card card">
+              <div
+                id="dropzone"
+                class="dropzone"
+                tabindex="0"
+                role="button"
+                aria-label="上传图片"
+              >
+                <input
+                  id="image-file"
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp"
+                  hidden
+                />
+                <div id="upload-placeholder">
+                  <span>＋</span><strong>拖入图片，或点击上传</strong
+                  ><small>PNG、JPG、WebP · 最大 10 MB</small>
+                </div>
+                <img id="image-preview" alt="待判断的图片" hidden />
+              </div>
+              <button type="button" class="secondary wide" id="image-sample">
+                先用案例截图试一下</button
+              ><label
+                >要判断的命题<input
+                  id="image-statement"
+                  value="图片中的发票已经付款成功。"
+                  required /></label
+              ><label
+                >补充背景（可选）<textarea
+                  id="image-context"
+                  rows="2"
+                  placeholder="例如：这是一次付款操作后的页面截图。"
+                ></textarea></label
+              ><button class="primary wide" id="image-submit" type="submit">
+                判断这张图片 <span>↗</span>
+              </button>
+            </form>
+            <div class="answers-card card">
+              <div class="card-eyebrow">判断结果</div>
+              <div id="image-answers" class="answer-output">
+                <div class="answer-empty">
+                  <span>▧</span>
+                  <h3>把你想确认的事情说清楚</h3>
+                  <p>例如：页面显示登录成功，或图片中有一只猫。</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section
+          class="tab-panel"
+          id="panel-runs"
+          hidden
+          aria-labelledby="runs-title"
+        >
+          <div class="page-heading">
+            <div>
+              <div class="eyebrow">04 / RUN HISTORY</div>
+              <h1 id="runs-title">每一次观察，都有迹可循。</h1>
+              <p>
+                查看此前的案例、逐步截图与模型结果。刷新页面后也能继续回看。
+              </p>
+            </div>
+            <button class="secondary" id="refresh-runs">刷新记录</button>
+          </div>
+          <div id="runs-list" class="runs-list"></div>
+        </section>
+      </main>
+      <footer class="app-footer">
+        <span>OneJev Studio</span><span id="model-name">OneJev1.6-0.8B</span
+        ><span>概率为模型估计，请结合实际样本评估。</span>
+      </footer>
+    </div>
+    <div class="toast" id="toast" role="alert" hidden></div>
+    <dialog id="image-dialog">
+      <button id="close-dialog" class="secondary">关闭 ×</button
+      ><img id="large-frame" alt="案例截图放大查看" />
+    </dialog>
+  </body>
+</html>

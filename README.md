@@ -136,6 +136,48 @@ EOF
 The API is compatible with TypeSafe System One. More examples: [video](examples/video.py),
 [curl](examples/curl.sh), [official TypeSafe SDK](examples/official_sdk.py).
 
+### Interactive Studio
+
+[OneJev Studio](examples/studio.md) brings browser tasks, text checks, image checks and
+run history into one persistent local website. Step through a task manually, pause an
+automatic demonstration, adjust its speed and replay screenshots. Final results stay visible.
+
+```bash
+pip install -e '.[browser]'
+qev studio
+```
+
+Open **http://127.0.0.1:7860**. Installed Chrome is detected automatically; otherwise run
+`python -m playwright install chromium` first. Studio reuses a running model server or
+starts local Flide. If inference uses a different environment, pass
+`--inference-python /path/to/inference/python` once; Studio remembers it locally.
+
+The optional [Viser robot workbench](examples/robot.md) adds a rotatable six-axis arm,
+scripted pick-and-place skills, fault demonstrations and fixed-camera OneJev checks.
+Its one-click full demo automatically runs a selected preset, including visual checks,
+while retaining uncertain judgments for review; supervised playback can pause on them.
+Play a preset or all four cases for 1–20 rounds, with per-case reports and an archived
+summary. Transient visual failures retry the same observation without repeating motion.
+A managed private camera keeps visual checks running after the interactive page closes.
+If its browser is unavailable, Studio explicitly falls back to a connected page viewer.
+Install `pip install -e '.[browser,robot]'` and open `/#robot` in the same Studio.
+This is a kinematic visualization with independent scene acceptance, not a dynamics simulator.
+
+### Browser automation with Playwright
+
+The [browser verification example](examples/browser_verify.md) connects page actions,
+screenshots, OneJev judgments and bounded retries. It includes a local invoice demo,
+failure scenarios, a mode for checking an existing page, and per-step screenshots and JSON reports.
+
+```bash
+pip install -e '.[browser]'
+python -m playwright install chromium
+python examples/browser_verify.py
+```
+
+Keep a model server running separately. Use `--channel chrome` with an installed Google Chrome,
+or `--base-url` to select a different model endpoint.
+
 ## Training
 
 ```bash

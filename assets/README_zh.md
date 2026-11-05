@@ -128,6 +128,36 @@ EOF
 
 接口兼容 TypeSafe System One。更多示例：[视频](../examples/video.py)、[curl](../examples/curl.sh)、[官方 TypeSafe SDK](../examples/official_sdk.py)。
 
+### 统一交互网站
+
+[OneJev Studio](../examples/studio.md) 把浏览器任务、文本判断、图片理解和运行记录放在同一个本地网站里。
+支持单步执行、自动演示、暂停、速度调节和截图回放，最终结果会一直保留。
+
+```bash
+pip install -e '.[browser]'
+qev studio
+```
+
+打开 **http://127.0.0.1:7860**。系统安装了 Chrome 时会自动使用它，否则先运行
+`python -m playwright install chromium`。网站会复用已有模型服务，或自动启动本机 Flide。
+如果 GPU 推理使用独立环境，首次添加 `--inference-python /path/to/inference/python`，后续无需重复指定。
+
+[Viser 机器人工作台](../examples/robot.md) 在同一网站提供六轴机械臂、抓放技能、故障演示和固定相机的 OneJev 视觉检查。
+首次安装 `pip install -e '.[browser,robot]'`，打开网站的 `/#robot` 页面即可。该版本是运动学展示，不是动力学仿真。
+
+### 搭配 Playwright 做网页操作验证
+
+[浏览器验证示例](../examples/browser_verify.md#中文使用说明)将网页操作、截图、OneJev 判断和有限次数重试连接起来，
+提供本地发票演示、失败场景、已有网页检查，以及每一步的截图和 JSON 报告。
+
+```bash
+pip install -e '.[browser]'
+python -m playwright install chromium
+python examples/browser_verify.py
+```
+
+保持模型服务单独运行。系统已安装 Google Chrome 时可加 `--channel chrome`，通过 `--base-url` 指定其他模型服务地址。
+
 ## 训练
 
 ```bash
