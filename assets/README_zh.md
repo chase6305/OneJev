@@ -69,7 +69,7 @@ OneJev 是基于 [Qwen](https://huggingface.co/Qwen) 的多模态 System One 决
 
 ## 快速开始
 
-任选一种后端启动，再运行下面的 Python 示例。
+任选一种后端启动，再运行下面的请求示例。
 
 ### 选项 A：Flide
 
@@ -108,7 +108,7 @@ cp docker/.env.example docker/.env   # 受限/私有仓库请设置 HF_TOKEN
 服务地址是 `http://localhost:8000`。在另一个终端中，用你自己的 `screenshot.png` 运行示例：
 
 ```bash
-IMG=$(base64 -w0 screenshot.png)
+IMG=$(base64 < screenshot.png | tr -d '\r\n')
 curl http://localhost:8000/v1/systemone -H "Content-Type: application/json" -d @- <<EOF
 {
   "state": {"任务": "支付 ACME 的待付款发票", "屏幕": "<image:1>"},
@@ -127,6 +127,13 @@ EOF
 `answers.完成状态.noul` 是“是”的概率，`answers.下一步.probabilities` 给出每个选项的概率，`answers.任务进度.score` 是期望等级。
 
 接口兼容 TypeSafe System One。更多示例：[视频](../examples/video.py)、[curl](../examples/curl.sh)、[官方 TypeSafe SDK](../examples/official_sdk.py)。
+
+使用 `qev serve` 时，每张编码图片或视频帧默认上限为 32 MiB，可通过 `--max-image-bytes 字节数` 调整。
+视频 `fps` 必须是有限正数。PyTorch 后端设置 `--media-root` 后可读取该目录内的本地媒体文件。
+推理请求在共享引擎上排队，期间 `/health` 和 `/v1/models` 仍可响应。
+`qev` 调试诊断中的非有限值会以 `"NaN"`、`"Infinity"` 或 `"-Infinity"` 字符串保留。
+启用 CUDA Graph 后，尺寸不支持或捕获显存不足的请求会使用常规推理。
+捕获条件在视觉编码和解码器预热前检查，预热后还会再次确认显存余量。
 
 ### 统一交互网站
 
@@ -194,6 +201,46 @@ torchrun --nproc-per-node 4 -m train.sft --config train/configs/onejev_4b_full.y
 ```bash
 flide serve --model train/runs/onejev_4b/final --format onejev --port 8000
 ```
+
+## 开发
+
+安装开发依赖并运行核心测试，无需下载模型或使用 GPU：
+
+```bash
+pip install -e ".[dev]"
+python -m pytest -q
+```
+
+安装 PyTorch 后，测试还会使用随机初始化的小模型核对训练输出和梯度。
+`--share-prefix` 打包训练支持全注意力和滑动窗口注意力；含媒体的样本使用普通批处理。
+
+使用已有的本地 OneJev 模型运行可选 CUDA 测试：
+
+```bash
+QEV_TEST_MODEL=/path/to/local/OneJev python -m pytest -q tests/test_inference.py tests/test_cuda_graphs.py tests/test_fp8.py
+```
+
+运行 Playground 浏览器测试：
+
+```bash
+pip install playwright
+python -m playwright install --only-shell chromium
+QEV_TEST_BROWSER=1 python -m pytest -q tests/test_playground.py
+```
+
+使用本地分词器测量请求规划开销，可指定 Git 版本进行对比：
+
+```bash
+python -m benchmarks.request_planning --tokenizer /path/to/local/OneJev --baseline-ref HEAD~1
+# 同时测量嵌套结构化证据的序列化开销：
+python -m benchmarks.request_planning --tokenizer /path/to/local/OneJev --structured-state
+```
+
+该基准测量提示词渲染、分词和答案组装，不加载模型权重或执行推理。
+多问题请求会合并分词，仍按完整提示词校验共享前缀边界。结构化 state 在单次请求内只序列化一次，
+由各分支提示词复用；分支 token 先组成完整批次再传入设备。常规分支推理的 token 预算按每行的前缀加最长问题后缀计算。
+比较性能时请保持
+`RAYON_NUM_THREADS` 一致，避免分词线程数影响结果。
 
 ## Friendly Links
 

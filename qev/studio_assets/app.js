@@ -38,6 +38,8 @@ let session = null,
   selectedStep = null,
   readonly = false,
   imageData = null,
+  imageLoading = false,
+  imageRevision = 0,
   activeTab = "browser",
   historySignature = "",
   working = false,
@@ -92,6 +94,12 @@ function toast(message) {
     $("toast").hidden = true;
   }, 6000);
 }
+function tabFromLocation() {
+  const tab = location.hash.slice(1);
+  return ["browser", "text", "image", "robot", "runs"].includes(tab)
+    ? tab
+    : "browser";
+}
 function switchTab(tab) {
   activeTab = tab;
   document.querySelectorAll(".tab-panel").forEach((panel) => {
@@ -119,6 +127,7 @@ document
   .forEach((button) =>
     button.addEventListener("click", () => switchTab(button.dataset.tab)),
   );
+window.addEventListener("hashchange", () => switchTab(tabFromLocation()));
 async function refreshStatus() {
   try {
     const status = await api("/api/status");
@@ -163,7 +172,7 @@ function renderControls() {
   $("reset").disabled = working || Boolean(session?.busy);
   $("scenario").disabled = working || Boolean(session?.busy);
   $("text-submit").disabled = !ready || $("text-form").dataset.busy === "1";
-  $("image-submit").disabled = !ready || $("image-form").dataset.busy === "1";
+  $("image-submit").disabled = !ready || imageLoading || $("image-form").dataset.busy === "1";
 }
 function applySession(data, fromHistory = false) {
   session = data;
@@ -268,7 +277,7 @@ async function newSession() {
   working = true;
   renderControls();
   try {
-    if (session?.auto_running)
+    if (session?.auto_running && !readonly)
       await api(`/api/sessions/${session.id}/pause`, {});
     const data = await api("/api/sessions", { scenario: $("scenario").value });
     if (revision !== viewRevision) return;
@@ -436,6 +445,7 @@ function renderAnswers(target, data) {
   target.innerHTML = content;
 }
 async function submitAsk(form, target, payload) {
+  if (form.dataset.busy === "1") return;
   const revision = form.dataset.revision || "0";
   form.dataset.busy = "1";
   renderControls();
@@ -446,7 +456,8 @@ async function submitAsk(form, target, payload) {
     if ((form.dataset.revision || "0") === revision)
       renderAnswers(target, data);
   } catch (error) {
-    target.innerHTML = `<div class="inline-error">${esc(error.message)}</div>`;
+    if ((form.dataset.revision || "0") === revision)
+      target.innerHTML = `<div class="inline-error">${esc(error.message)}</div>`;
   } finally {
     form.dataset.busy = "0";
     renderControls();
@@ -461,23 +472,41 @@ $("text-form").addEventListener("submit", (event) => {
     statement: $("text-statement").value,
   });
 });
-function loadImage(blob) {
+function beginImageLoad() {
+  imageLoading = true;
+  invalidateAnswer("image");
+  renderControls();
+  return ++imageRevision;
+}
+function imageLoadFailed(message, revision) {
+  if (revision !== undefined && revision !== imageRevision) return;
+  if (revision !== undefined) imageLoading = false;
+  renderControls();
+  toast(message);
+}
+function loadImage(blob, revision) {
+  if (revision !== undefined && revision !== imageRevision) return;
   if (!blob.type.startsWith("image/")) {
-    toast("请选择图片文件。");
+    imageLoadFailed("请选择图片文件。", revision);
     return;
   }
   if (blob.size > 10 * 1024 * 1024) {
-    toast("图片超过 10 MB，请缩小后再上传。");
+    imageLoadFailed("图片超过 10 MB，请缩小后再上传。", revision);
     return;
   }
+  revision ??= beginImageLoad();
   const reader = new FileReader();
   reader.onload = () => {
+    if (revision !== imageRevision) return;
     imageData = reader.result;
     $("image-preview").src = imageData;
     $("image-preview").hidden = false;
     $("upload-placeholder").hidden = true;
-    invalidateAnswer("image");
+    imageLoading = false;
+    renderControls();
   };
+  reader.onerror = () => imageLoadFailed("无法读取图片，请重新选择。", revision);
+  reader.onabort = () => imageLoadFailed("图片读取已取消，请重新选择。", revision);
   reader.readAsDataURL(blob);
 }
 $("dropzone").addEventListener("click", () => $("image-file").click());
@@ -506,16 +535,18 @@ $("image-file").addEventListener("change", (event) => {
   }),
 );
 $("image-sample").addEventListener("click", async () => {
+  const revision = beginImageLoad();
   try {
     const response = await fetch("/api/sample.png");
     if (!response.ok) throw new Error("案例图片暂时无法加载，请稍后重试。");
-    loadImage(await response.blob());
+    loadImage(await response.blob(), revision);
   } catch (error) {
-    toast(error.message);
+    imageLoadFailed(error.message, revision);
   }
 });
 $("image-form").addEventListener("submit", (event) => {
   event.preventDefault();
+  if (imageLoading) return;
   if (!imageData) {
     toast("请先上传图片，或选择案例截图。");
     return;
@@ -607,34 +638,22 @@ async function boot() {
     $("speed-label").textContent = `${speed} 秒`;
   }
   await refreshStatus();
-  if (location.hash === "#robot") {
-    const savedBrowser = localStorage.getItem("onejev-studio-session");
-    if (savedBrowser) {
-      try {
-        applySession(await api(`/api/sessions/${savedBrowser}`));
-      } catch (error) {
-        if (error.status !== 404)
-          toast("浏览器案例暂时无法恢复，机器人视图仍可使用。");
-      }
-    }
-    switchTab("robot");
-    poll();
-    return;
-  }
+  const tab = tabFromLocation();
   const saved = localStorage.getItem("onejev-studio-session");
   if (saved)
     try {
       applySession(await api(`/api/sessions/${saved}`));
       $("scenario").value = session.scenario;
     } catch (error) {
-      if (error.status === 404) await newSession();
-      else {
+      if (error.status === 404)
+        localStorage.removeItem("onejev-studio-session");
+      else if (tab === "browser") {
         toast("暂时无法恢复案例，正在重试连接。");
         setTimeout(boot, 2000);
         return;
-      }
+      } else toast("浏览器案例暂时无法恢复，当前视图仍可使用。");
     }
-  else await newSession();
+  switchTab(tab);
   poll();
 }
 boot();
@@ -643,7 +662,7 @@ function invalidateAnswer(kind) {
   const form = $(`${kind}-form`),
     target = $(`${kind}-answers`);
   form.dataset.revision = String(Number(form.dataset.revision || 0) + 1);
-  if (target.querySelector(".answer-block") || form.dataset.busy === "1")
+  if (target.querySelector(".answer-block, .inline-error") || form.dataset.busy === "1")
     target.innerHTML =
       '<div class="answer-empty"><p>输入已更改，请重新判断。</p></div>';
 }

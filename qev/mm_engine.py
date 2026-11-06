@@ -18,14 +18,15 @@ import copy
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import media as mmedia
 from .calibrate import Calibration, softmax
-from .engine import BranchResult, DecisionEngine, EngineInfo
-from .prompt import DEFAULT_STYLE, PromptStyle, RenderedQuestion, build_messages, render_question
+from .engine import BranchResult, DecisionEngine, EngineInfo, _padded_suffixes
+from .prompt import DEFAULT_STYLE, PromptStyle, RenderedQuestion, render_question
 from .schema import SystemOneRequest, SystemOneResponse
 
 log = logging.getLogger("qev.mm_engine")
@@ -49,6 +50,19 @@ def local_model_dir(name: str) -> str:
 
 class GraphMemoryLow(RuntimeError):
     """Not enough free GPU memory to capture another graph, even after dropping the cached ones."""
+
+
+@contextmanager
+def _capture_graph(graph, stream=None):
+    """Allocate BLAS scratch space in this graph's own memory pool."""
+    import torch
+
+    # PyTorch's stream-keyed workspace cache can make independent graphs share
+    # scratch memory. Evicting its owning graph then breaks surviving replays.
+    torch.cuda.synchronize()
+    torch._C._cuda_clearCublasWorkspaces()
+    with torch.cuda.graph(graph, stream=stream):
+        yield
 
 
 def _host_available() -> int:
@@ -99,6 +113,7 @@ class DecoderGraphs:
         if self.sizes:
             self.max_len, self.max_graphs = self.sizes[-1], max(max_graphs, len(self.sizes))
         self.graphs: collections.OrderedDict[int, tuple] = collections.OrderedDict()
+        self._warmup_stream = None
 
     def _size(self, n: int) -> int | None:
         if self.sizes:
@@ -119,13 +134,20 @@ class DecoderGraphs:
 
     def __call__(self, embeds, positions):
         """embeds (1, L, hidden), positions (3, 1, L) -> final-norm hidden state at position L - 1, or None when L is
-        over the largest graph."""
+        over the largest graph. `embeds` may also be a no-argument provider, resolved after admission."""
         import torch
 
-        n = embeds.shape[1]
+        # A lazy embedding provider lets the caller avoid running the vision
+        # tower when this shape or its next capture cannot be admitted.
+        lazy = callable(embeds)
+        n = positions.shape[-1] if lazy else embeds.shape[1]
         size = self._size(n)
         if size is None:
             return None
+        if size not in self.graphs:
+            _make_room(self._evict)
+        if lazy:
+            embeds = embeds()
         if size in self.graphs:
             self.graphs.move_to_end(size)
         emb, pos, out, graph = self.graphs.get(size) or self._capture(size, embeds, positions)
@@ -148,13 +170,20 @@ class DecoderGraphs:
     def _capture(self, size: int, embeds, positions):
         import torch
 
+        # Reject an unavailable capture before allocating its inputs or running
+        # two decoder warmups. Recheck after warmup before capturing as well.
+        _make_room(self._evict)
         emb = torch.zeros((1, size, embeds.shape[-1]), dtype=embeds.dtype, device=embeds.device)
         pos = torch.arange(size, device=embeds.device, dtype=positions.dtype).view(1, 1, -1).repeat(3, 1, 1)
 
         def run():
             return self.decoder(inputs_embeds=emb, position_ids=pos, use_cache=False, return_dict=True).last_hidden_state
 
-        side = torch.cuda.Stream()
+        # cuBLAS keeps a workspace per stream even after its graphs are evicted.
+        # Reuse the warmup stream so new prompt sizes do not accumulate them.
+        if self._warmup_stream is None:
+            self._warmup_stream = torch.cuda.Stream(device=embeds.device)
+        side = self._warmup_stream
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             for _ in range(2):
@@ -164,7 +193,7 @@ class DecoderGraphs:
             self.graphs.popitem(last=False)
         _make_room(self._evict)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with _capture_graph(graph):
             out = run()
         self.graphs[size] = (emb, pos, out, graph)
         log.info("captured a decoder graph for %d tokens", size)
@@ -194,17 +223,27 @@ class ForkGraphs:
         self.max_graphs = max_graphs
         self.prefills: collections.OrderedDict[int, tuple] = collections.OrderedDict()
         self.branches: collections.OrderedDict[tuple[int, int, int], tuple] = collections.OrderedDict()
+        self._warmup_stream = None
 
     def __call__(self, embeds, positions, suffixes: list[list[int]], delta: int):
         """embeds (1, P, hidden) and positions (3, 1, P) of the prefix; token ids of each branch. Returns the
-        final-norm hidden state at each branch's last token (rows x hidden), or None when a size is over the limits."""
+        final-norm hidden state at each branch's last token (rows x hidden), or None when a size is over the limits.
+        `embeds` may be a no-argument provider, resolved after admission."""
         import torch
 
-        n, P = len(suffixes), embeds.shape[1]
+        lazy = callable(embeds)
+        n, P = len(suffixes), positions.shape[-1] if lazy else embeds.shape[1]
         width = max(len(s) for s in suffixes)
         size, rows, wide = _bucket(P, self.step), n, _bucket(width, self.width_step)
         if size > self.max_len or rows > self.max_rows or wide > self.max_width:
             return None
+        key = (size, rows, wide)
+        if size not in self.prefills:
+            _make_room(self._evict)
+        elif key not in self.branches:
+            _make_room(lambda: self._evict(keep=size))
+        if lazy:
+            embeds = embeds()
         if size in self.prefills:
             self.prefills.move_to_end(size)
         emb, pos, pad, cache, graph = self.prefills.get(size) or self._capture_prefill(size, embeds, positions)
@@ -215,14 +254,10 @@ class ForkGraphs:
         pos[..., a:].copy_(positions)
         pad.fill_(a)
         graph.replay()
-        key = (size, rows, wide)
         if key in self.branches:
             self.branches.move_to_end(key)
         ids, base, pad_b, out, bgraph = self.branches.get(key) or self._capture_branch(key, cache, positions.dtype)
-        host = torch.full((rows, wide), self.pad_id, dtype=torch.long)
-        for r in range(rows):
-            s = suffixes[r % n]
-            host[r, :len(s)] = torch.tensor(s, dtype=torch.long)
+        host = _padded_suffixes(suffixes, self.pad_id, width=wide)
         ids.copy_(host, non_blocking=True)
         base.fill_(P + delta)
         pad_b.fill_(a)
@@ -251,10 +286,12 @@ class ForkGraphs:
         self.branches.clear()
         self.prefills.clear()
 
-    def _side_warmup(self, run) -> None:
+    def _side_warmup(self, run, device) -> None:
         import torch
 
-        side = torch.cuda.Stream()
+        if self._warmup_stream is None:
+            self._warmup_stream = torch.cuda.Stream(device=device)
+        side = self._warmup_stream
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             for _ in range(2):
@@ -264,6 +301,7 @@ class ForkGraphs:
     def _capture_prefill(self, size: int, embeds, positions):
         import torch
 
+        _make_room(self._evict)
         dev = embeds.device
         emb = torch.zeros((1, size, embeds.shape[-1]), dtype=embeds.dtype, device=dev)
         pos = torch.zeros((3, 1, size), dtype=positions.dtype, device=dev)
@@ -277,12 +315,12 @@ class ForkGraphs:
                                 attention_mask={"full_attention": mask.view(1, 1, size, size),
                                                 "linear_attention": None}).past_key_values
 
-        self._side_warmup(run)
+        self._side_warmup(run, dev)
         while len(self.prefills) >= self.max_graphs:
             self._drop_prefix(next(iter(self.prefills)))
         _make_room(self._evict)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with _capture_graph(graph):
             cache = run()
         self.prefills[size] = (emb, pos, pad, cache, graph)
         log.info("captured a prefix graph for %d tokens", size)
@@ -292,6 +330,7 @@ class ForkGraphs:
         import torch
 
         size, rows, wide = key
+        _make_room(lambda: self._evict(keep=size))
         dev = self.prefills[size][0].device
         ids = torch.full((rows, wide), self.pad_id, dtype=torch.long, device=dev)
         base = torch.zeros((), dtype=pos_dtype, device=dev)
@@ -309,12 +348,12 @@ class ForkGraphs:
                                 attention_mask={"full_attention": mask.view(1, 1, wide, size + wide).expand(rows, 1, -1, -1),
                                                 "linear_attention": None}).last_hidden_state
 
-        self._side_warmup(run)
+        self._side_warmup(run, dev)
         while len(self.branches) >= 8 * self.max_graphs:
             self.branches.popitem(last=False)
         _make_room(lambda: self._evict(keep=size))
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with _capture_graph(graph):
             out = run()
         self.branches[key] = (ids, base, pad, out, graph)
         log.info("captured a branch graph for %d rows x %d tokens over a %d-token prefix", rows, wide, size)
@@ -352,6 +391,7 @@ class MMDecisionEngine(DecisionEngine):
         gpu_preprocess: bool = False,
         cuda_graphs: bool = False,
         quantize: str | None = None,
+        max_image_bytes: int = mmedia.MAX_IMAGE_BYTES,
     ) -> None:
         import torch
         import transformers
@@ -368,8 +408,11 @@ class MMDecisionEngine(DecisionEngine):
         self.media_root = media_root
         self.allow_local_paths = allow_local_paths
         self.gpu_preprocess = gpu_preprocess
+        if max_image_bytes <= 0:
+            raise ValueError("max_image_bytes must be positive")
+        self.max_image_bytes = max_image_bytes
         self._want_mass = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._loaded: tuple = ([], [], [])
         self._media: list[dict] = []
         self._prep: Prepared | None = None
@@ -399,8 +442,6 @@ class MMDecisionEngine(DecisionEngine):
         if quantize:
             self._quantize(quantize, stored_dir=model_path if stored_fp8 else None)
         self.head_dtype = head_dtype
-        if head_dtype != dtype:
-            self._upcast_head(getattr(torch, head_dtype))
         self.model_type = config.model_type
         self.template_kwargs = {"enable_thinking": False} if "qwen" in self.model_type else {}
         self.slot_ids = self._verify_slots()
@@ -421,7 +462,8 @@ class MMDecisionEngine(DecisionEngine):
                                transformers_version=transformers.__version__, torch_version=torch.__version__,
                                extra={"head_dtype": head_dtype, "multimodal": True})
         if fork_mode == "auto":
-            self._select_fork_mode()
+            with self._device_context():
+                self._select_fork_mode()
         else:
             self.info.fork_mode = fork_mode
         log.info("loaded %s (%s, vision) in %.1fs, fork_mode=%s", model_path, self.model_type,
@@ -437,28 +479,6 @@ class MMDecisionEngine(DecisionEngine):
             raise ValueError(f"unknown quantization {kind!r}")
         n = quantize_linears(self.model, stored_reader(stored_dir) if stored_dir else None)
         log.info("fp8: %d decoder linear layers%s", n, " from the checkpoint" if stored_dir else " quantized on load")
-
-    def _init_slot_head(self) -> None:
-        """The output-head rows of the option-letter slots, in the head dtype. An answer needs only these logits; the
-        full vocabulary is computed only for the debug diagnostics (allowed-token mass)."""
-        import torch
-
-        head = self.model.get_output_embeddings()
-        ids = torch.tensor(self.slot_ids, device=head.weight.device)
-        dt = getattr(torch, self.head_dtype)
-        self._slot_w = head.weight.detach().index_select(0, ids).to(dt)
-        bias = getattr(head, "bias", None)
-        self._slot_b = None if bias is None else bias.detach().index_select(0, ids).to(dt)
-
-    def _readout_rows(self, hidden, n_slots: list[int]) -> list[tuple[list[float], float]]:
-        """Slot logits for each row of `hidden` (rows x hidden size, final-norm output), with one host sync."""
-        if self._want_mass:
-            vocab = self.model.get_output_embeddings()(hidden)
-            return [self._readout(vocab[i], n) for i, n in enumerate(n_slots)]
-        sel = hidden.to(self._slot_w.dtype) @ self._slot_w.T
-        if self._slot_b is not None:
-            sel = sel + self._slot_b
-        return [(row[:n], float("nan")) for row, n in zip(sel.tolist(), n_slots)]
 
     def _embed(self, inputs: dict):
         """Token embeddings with the vision features written into the image and video placeholders, as the model's
@@ -516,7 +536,7 @@ class MMDecisionEngine(DecisionEngine):
             proc.rescale_and_normalize = on_gpu
 
     def _render_prompt(self, state: Any, suffix: str) -> str:
-        return mmedia.render_prompt(self.processor, self.template_kwargs, build_messages(state, suffix, self.style),
+        return mmedia.render_prompt(self.processor, self.template_kwargs, self._messages(state, suffix),
                                     self._media)
 
     def _prepare(self, state: Any, rendered: list[RenderedQuestion]) -> Prepared:
@@ -530,9 +550,9 @@ class MMDecisionEngine(DecisionEngine):
         if self._prep is not None and self._prep.key == key:
             return self._prep
         prompts = [self._render_prompt(state, r.suffix) for r in rendered]
-        full = [self._encode(p) for p in prompts]
+        full = self._encode_many(prompts)
         prefix_text = self._render_prompt(state, MARK)
-        prefix_u = self._encode(prefix_text[:prefix_text.index(MARK)])
+        prefix_u = self._encode(prefix_text[:prefix_text.rindex(MARK)])
         n = len(prefix_u)
         while n > 0 and not all(ids[:n] == prefix_u[:n] for ids in full):
             n -= 1
@@ -593,7 +613,7 @@ class MMDecisionEngine(DecisionEngine):
             t = inputs["mm_token_type_ids"]
             inputs["mm_token_type_ids"] = torch.cat([t, torch.zeros((1, len(suf)), dtype=t.dtype, device=dev)], 1)
         pos = torch.cat([prep.positions, self._suffix_positions(P, len(suf), 1, prep.delta).to(prep.positions.dtype)], -1)
-        last = self._graph_call("_graphs", lambda g: g(self._embed(inputs), pos))
+        last = self._graph_call("_graphs", lambda g: g(lambda: self._embed(inputs), pos))
         if last is None:
             last = self.model.model(**inputs, position_ids=pos, use_cache=False, return_dict=True).last_hidden_state[:, -1]
         (logits, mass), = self._readout_rows(last, [r.n_slots])
@@ -633,13 +653,14 @@ class MMDecisionEngine(DecisionEngine):
 
         prep = self._prepare(state, rendered)
         P = len(prep.prefix_ids)
-        chunk = max(1, min(len(rendered), self.fork_token_budget // max(P, 1)))
+        width = max(map(len, prep.suffixes))
+        chunk = max(1, min(len(rendered), self.fork_token_budget // max(P + width, 1)))
         results: list[BranchResult | None] = [None] * len(rendered)
         with torch.inference_mode():
             if len(rendered) == 1:
                 return self._run_single(prep, rendered)
             last = self._graph_call("_fork_graphs",
-                                    lambda g: g(self._embed(prep.inputs), prep.positions, prep.suffixes, prep.delta))
+                                    lambda g: g(lambda: self._embed(prep.inputs), prep.positions, prep.suffixes, prep.delta))
             if last is not None:
                 outs = self._readout_rows(last, [r.n_slots for r in rendered])
                 return [BranchResult(r.qid, r.kind, r.labels, r.descriptions, lg, m, len(s))
@@ -668,19 +689,15 @@ class MMDecisionEngine(DecisionEngine):
         dev = self.device
         sufs = [suffixes[i] for i in idx]
         width = max(len(s) for s in sufs)
-        ids = torch.full((len(idx), width), self.pad_id, dtype=torch.long, device=dev)
-        mask = torch.zeros((len(idx), P + width), dtype=torch.long, device=dev)
-        ends = []
-        for row, s in enumerate(sufs):
-            ids[row, : len(s)] = torch.tensor(s, device=dev)
-            mask[row, : P + len(s)] = 1
-            ends.append(len(s) - 1)
+        ids = _padded_suffixes(sufs, self.pad_id, device=dev)
+        lengths = torch.tensor([len(s) for s in sufs], device=dev)
+        mask = (torch.arange(P + width, device=dev)[None] < P + lengths[:, None]).long()
         cache = self._fork(base, len(idx))
         try:
             o = self.model.model(input_ids=ids, attention_mask=mask,
                                  position_ids=self._suffix_positions(P, width, len(idx), delta),
                                  past_key_values=cache, use_cache=True, return_dict=True)
-            last = o.last_hidden_state[torch.arange(len(idx), device=dev), torch.tensor(ends, device=dev)]
+            last = o.last_hidden_state[torch.arange(len(idx), device=dev), lengths - 1]
             outs = self._readout_rows(last, [rendered[i].n_slots for i in idx])
             for row, i in enumerate(idx):
                 r = rendered[i]
@@ -700,21 +717,23 @@ class MMDecisionEngine(DecisionEngine):
                 out = self.processor(text=[self._render_prompt(state, r.suffix)], return_tensors="pt",
                                      **self._processor_kwargs())
                 out = {k: v.to(self.device) for k, v in out.items()}
-                o = self.model(**out, use_cache=False, return_dict=True, logits_to_keep=1)
-                out_logits.append(self._readout(o.logits[0, -1], r.n_slots)[0])
+                o = self.model.model(**out, use_cache=False, return_dict=True)
+                (logits, _), = self._readout_rows(o.last_hidden_state[:, -1], [r.n_slots])
+                out_logits.append(logits)
                 del o
         return out_logits
 
     def _set_media(self, items: list[dict]) -> None:
         self._prep = None
-        self._media = items
+        self._media, self._loaded = [], ([], [], [])
         try:
-            self._loaded = mmedia.load(items, self.media_root, self.allow_local_paths) if items else ([], [], [])
+            loaded = mmedia.load(items, self.media_root, self.allow_local_paths,
+                                 max_image_bytes=self.max_image_bytes) if items else ([], [], [])
         except mmedia.MediaError:
             raise
         except Exception as exc:
-            self._media, self._loaded = [], ([], [], [])
             raise mmedia.MediaError(f"could not load media: {type(exc).__name__}: {exc}") from exc
+        self._media, self._loaded = items, loaded
 
     def decide(self, request: SystemOneRequest, debias: int = 1, debug: bool = False,
                media: list | None = None) -> tuple[SystemOneResponse, dict[str, Any]]:

@@ -418,6 +418,9 @@ window.OneJevRobot = (() => {
       .querySelectorAll("[data-playlist-run]")
       .forEach((button) =>
         button.addEventListener("click", async () => {
+          const epoch = ++viewRevision;
+          const runId = state?.id,
+            revision = state?.revision;
           try {
             const itemEvent =
               button.dataset.playlistEvent === ""
@@ -426,6 +429,13 @@ window.OneJevRobot = (() => {
             const report = await robotApi(
               `/api/robot/runs/${button.dataset.playlistRun}`,
             );
+            if (
+              epoch !== viewRevision ||
+              state?.id !== runId ||
+              state?.revision !== revision ||
+              working
+            )
+              return;
             await perform("replay", {
               source_id: report.id,
               event_index: Number.isInteger(itemEvent)
@@ -433,7 +443,7 @@ window.OneJevRobot = (() => {
                 : report.events.length - 1,
             });
           } catch (error) {
-            toast(error.message);
+            if (epoch === viewRevision) toast(error.message);
           }
         }),
       );
@@ -691,6 +701,7 @@ window.OneJevRobot = (() => {
     $(id).addEventListener("click", () => perform("live"));
   $("robot-runs-refresh").addEventListener("click", loadRuns);
   $("robot-run").addEventListener("change", async () => {
+    const epoch = ++viewRevision;
     const identifier = $("robot-run").value;
     if (!identifier) {
       perform("live");
@@ -700,7 +711,12 @@ window.OneJevRobot = (() => {
       revision = state?.revision;
     try {
       const report = await robotApi(`/api/robot/runs/${identifier}`);
-      if (state?.id !== runId || state?.revision !== revision || working) {
+      if (
+        epoch !== viewRevision ||
+        state?.id !== runId ||
+        state?.revision !== revision ||
+        working
+      ) {
         render();
         return;
       }
@@ -715,8 +731,10 @@ window.OneJevRobot = (() => {
         render();
       }
     } catch (error) {
-      toast(error.message);
-      render();
+      if (epoch === viewRevision) {
+        toast(error.message);
+        render();
+      }
     }
   });
   refresh();

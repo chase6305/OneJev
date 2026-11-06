@@ -143,17 +143,21 @@ Studio 会在第一次视觉检查时启动并管理内置相机渲染。它不�
 “当前演示”下拉框可选择之前的记录，包括重置或网站重启前保存的记录；列表显示最近
 100 次演示。旧版仅含相机截图的记录可导出 JSON，但不能回放缺失的三维姿态。
 “导出 JSON”下载所选演示的完整报告。
+快速切换历史记录或返回当前场景时，以最后一次选择为准；较早开始的读取不会重新切换回放。
 
 动作/故障轨迹、视觉截图、原始输出、独立验收和姿态保存在
 `runs/studio/robot/<运行 ID>/`。`report.json` 使用原子替换保存，`schema_version: 2`
 的 `events` 保存每次动作结束的姿态，`history` 保存视觉检查。
 三维回放展示的是这些记录点，并非逐帧动作录像。网站重启会创建新场景，不会自动执行
 旧动作；可从历史下拉框回看已保存的场景。
+相机截图以无损 PNG 保存，并将同一份图像发送给模型。编码和写盘在后台完成，
+不会阻塞状态查询；截图使用较快的压缩设置，文件会略大，像素保持不变。
+场景使用固定灯光，避免刚连接相机时因环境贴图尚未加载而得到明显偏暗的首帧。
 
 ## 验证
 
 ```bash
-QEV_BROWSER_TESTS=1 QEV_BROWSER_CHANNEL=chrome python -m unittest discover -s tests -v
+QEV_BROWSER_TESTS=1 QEV_BROWSER_CHANNEL=chrome python -m pytest -q tests/test_robot.py tests/test_robot_capture.py tests/test_studio_integration.py
 ```
 
 机器人检查覆盖可达性、完整抓放、抓空后恢复、掉落后恢复、目标移动、无效故障，
