@@ -12,9 +12,10 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from http.client import HTTPException as HTTPProtocolError
 from pathlib import Path
 from typing import Any, Literal
 from urllib.error import HTTPError, URLError
@@ -27,6 +28,7 @@ from pydantic import BaseModel, Field
 
 from .browser import GOAL, SUCCESS, STATUSES, Decision, Prediction, decide
 from .client import Choice, Client, Noul, Score
+from .reporting import json_safe, recent_reports
 
 ASSETS = Path(__file__).with_name("studio_assets")
 log = logging.getLogger("qev.studio")
@@ -49,29 +51,55 @@ class Backend:
         self.client = Client(config.backend_url, timeout=30)
         self.probe = Client(config.backend_url, timeout=2)
         self.process: subprocess.Popen | None = None
+        self.reachable = False
         self.state = "connecting"
         self.message = "正在连接模型…"
         self.model = config.model.split("/")[-1]
         self.lock = asyncio.Lock()
+        self.connect_task: asyncio.Task | None = None
+        self.closing = False
 
     def snapshot(self) -> dict:
         return {"state": self.state, "message": self.message, "model": self.model}
 
+    def reconnect(self) -> None:
+        if not self.closing and (self.connect_task is None or self.connect_task.done()):
+            self.connect_task = asyncio.create_task(self.connect())
+            self.connect_task.add_done_callback(self.connection_finished)
+
+    def connection_finished(self, task: asyncio.Task) -> None:
+        if not task.cancelled() and (error := task.exception()) is not None:
+            self.state, self.message = "error", "模型连接失败，请检查连接地址或网站运行日志"
+            log.error("Backend connection failed", exc_info=(type(error), error, error.__traceback__))
+
     async def refresh(self) -> dict:
+        self.reachable = False
         try:
             health = await asyncio.to_thread(self.probe._get, "/health")
+            self.reachable = True
+            if not isinstance(health, dict) or health.get("status") not in ("ok", "loading"):
+                self.state, self.message = "error", "模型服务返回的健康状态无效，请检查连接地址或服务日志"
+                return self.snapshot()
             if health.get("status") == "ok":
                 self.state, self.message = "ready", "模型已就绪"
-                self.model = health.get("model", self.model)
+                if isinstance(health.get("model"), str) and health["model"]:
+                    self.model = health["model"]
             else:
                 self.state, self.message = "loading", "模型正在加载，页面会自动更新"
         except HTTPError as exc:
+            self.reachable = True
             if exc.code == 503:
                 self.state, self.message = "loading", "模型正在加载，页面会自动更新"
             else:
                 self.state, self.message = "error", f"模型服务返回 HTTP {exc.code}"
-        except (URLError, OSError, ValueError):
-            if self.process is not None and self.process.poll() is None:
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.reachable = True
+            self.state, self.message = "error", "模型服务返回的健康状态无效，请检查连接地址或服务日志"
+        except (URLError, OSError, ValueError) as exc:
+            self.reachable = isinstance(exc, URLError) and isinstance(exc.reason, HTTPProtocolError)
+            if self.reachable:
+                self.state, self.message = "error", "模型健康检查响应不完整，正在重试"
+            elif self.process is not None and self.process.poll() is None:
                 self.state, self.message = "loading", "模型正在加载，页面会自动更新"
             elif self.process is not None:
                 self.state, self.message = "error", "模型启动失败，请查看网站运行日志后重新连接"
@@ -81,10 +109,19 @@ class Backend:
 
     async def connect(self) -> dict:
         async with self.lock:
-            await self.refresh()
-            if self.state in ("ready", "loading") or not self.config.autostart:
+            if self.closing:
                 return self.snapshot()
-            endpoint = urlparse(self.config.backend_url)
+            await self.refresh()
+            if self.closing or self.reachable or self.state in ("ready", "loading") or not self.config.autostart:
+                return self.snapshot()
+            try:
+                endpoint = urlparse(self.config.backend_url)
+                port = endpoint.port if endpoint.port is not None else 80
+                if port == 0:
+                    raise ValueError("invalid port")
+            except ValueError:
+                self.state, self.message = "error", "模型服务地址无效，请检查主机和端口"
+                return self.snapshot()
             if endpoint.scheme != "http" or endpoint.hostname not in ("127.0.0.1", "localhost", "::1"):
                 self.state, self.message = "error", "请确认配置的远端模型服务正在运行"
                 return self.snapshot()
@@ -95,13 +132,15 @@ class Backend:
                     [self.config.inference_python, "-c", "import flide"],
                     capture_output=True, timeout=15, check=False,
                 )
+                if self.closing:
+                    return self.snapshot()
                 if probe.returncode:
                     raise RuntimeError("推理环境尚未安装 Flide，请按使用说明配置推理环境")
                 self.config.output.mkdir(parents=True, exist_ok=True)
                 with (self.config.output / "backend.log").open("ab") as stream:
                     self.process = subprocess.Popen(
                         [self.config.inference_python, "-m", "flide.cli", "serve", "--model", self.config.model,
-                         "--host", endpoint.hostname, "--port", str(endpoint.port or 80)],
+                         "--host", endpoint.hostname, "--port", str(port)],
                         stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
                         start_new_session=True, env=dict(os.environ, PYTHONUNBUFFERED="1"),
                     )
@@ -116,8 +155,14 @@ class Backend:
             await self.refresh()
 
     async def close(self) -> None:
+        self.closing = True
+        if self.connect_task is not None:
+            await asyncio.gather(self.connect_task, return_exceptions=True)
         if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
+            try:
+                self.process.terminate()
+            except ProcessLookupError:
+                return
             try:
                 await asyncio.to_thread(self.process.wait, timeout=10)
             except subprocess.TimeoutExpired:
@@ -149,13 +194,13 @@ class Session:
         self.lock = asyncio.Lock()
 
     def snapshot(self) -> dict:
-        return {
+        return json_safe({
             "id": self.id, "scenario": self.scenario, "created_at": self.created_at,
             "attempts": self.attempts, "result": self.result, "error": self.error,
             "busy": self.lock.locked(), "auto_running": self.auto_running, "delay": self.delay,
             "retryable": self.retryable, "next_step_at": self.next_step_at,
             "frame": f"/api/runs/{self.id}/images/{self.frame}", "history": self.history,
-        }
+        })
 
     def save(self) -> None:
         data = self.snapshot()
@@ -174,6 +219,8 @@ class Studio:
         self.browser = None
         self.browser_lock = asyncio.Lock()
         self.session_lock = asyncio.Lock()
+        self.sample_lock = asyncio.Lock()
+        self.sample_png: bytes | None = None
         self.close_robot = None
 
     async def get_browser(self):
@@ -197,6 +244,23 @@ class Studio:
                     self.playwright = None
                     raise
             return self.browser
+
+    async def sample_image(self) -> bytes:
+        """Render the fixed example once, including when requests arrive together."""
+        async with self.sample_lock:
+            if self.sample_png is None:
+                browser = await self.get_browser()
+                page = await browser.new_page(viewport={"width": 1280, "height": 720})
+                try:
+                    await page.goto((ASSETS / "invoice.html").as_uri())
+                    await page.evaluate("render('paid')")
+                    png = await page.screenshot(animations="disabled")
+                finally:
+                    await page.close()
+                # A failed or cancelled render must leave the next request free
+                # to retry, rather than caching an error or a partial result.
+                self.sample_png = png
+            return self.sample_png
 
     async def create_session(self, scenario: str) -> Session:
         # Admission and browser allocation must share a lock: concurrent requests
@@ -314,9 +378,6 @@ class Studio:
                 session.next_step_at = None
                 if observation is not None:
                     observation["decision"] = {"action": "reconnect" if session.retryable else "error", "reason": session.error}
-                    # Non-finite model values must not corrupt the saved JSON report.
-                    observation["answers"] = json.loads(json.dumps(observation["answers"], default=str),
-                                                        parse_constant=lambda value: value)
                     session.history.append(observation)
                 if session.retryable:
                     await self.backend.refresh()
@@ -348,9 +409,7 @@ class Studio:
             session.next_step_at = None
             session.save()
 
-    async def close(self) -> None:
-        if self.close_robot is not None:
-            await self.close_robot()
+    async def close_sessions(self) -> None:
         tasks = []
         for session in self.sessions.values():
             session.auto_running = False
@@ -359,11 +418,17 @@ class Studio:
                 tasks.append(session.auto_task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        if self.browser is not None:
-            await self.browser.close()
-        if self.playwright is not None:
-            await self.playwright.stop()
-        await self.backend.close()
+
+    async def close(self) -> None:
+        async with AsyncExitStack() as resources:
+            resources.push_async_callback(self.backend.close)
+            if self.playwright is not None:
+                resources.push_async_callback(self.playwright.stop)
+            if self.browser is not None:
+                resources.push_async_callback(self.browser.close)
+            resources.push_async_callback(self.close_sessions)
+            if self.close_robot is not None:
+                await self.close_robot()
 
 
 class NewSession(BaseModel):
@@ -382,6 +447,16 @@ class AskOptions(BaseModel):
     image: str | None = Field(default=None, max_length=14_000_000)
 
 
+def validate_upload(image: str) -> None:
+    from PIL import Image
+
+    raw = base64.b64decode(image.split(",", 1)[1], validate=True)
+    with Image.open(io.BytesIO(raw)) as uploaded:
+        if uploaded.width * uploaded.height > 16_000_000:
+            raise ValueError("图片超过 1600 万像素，请缩小后上传")
+        uploaded.verify()
+
+
 def create_app(config: Config | None = None) -> FastAPI:
     config = config or Config()
     config.output = config.output.expanduser().resolve()
@@ -390,12 +465,11 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app):
-        startup = asyncio.create_task(studio.backend.connect())
+        studio.backend.reconnect()
         monitor = asyncio.create_task(studio.backend.monitor())
         try:
             yield
         finally:
-            await startup
             monitor.cancel()
             await asyncio.gather(monitor, return_exceptions=True)
             await studio.close()
@@ -422,8 +496,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/connect")
     async def connect():
-        if not studio.backend.lock.locked():
-            asyncio.create_task(studio.backend.connect())
+        studio.backend.reconnect()
         return studio.backend.snapshot()
 
     @app.post("/api/sessions")
@@ -481,19 +554,19 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(404)
         return path
 
+    def run_summaries(live_ids):
+        items = []
+        for data in recent_reports(config.output):
+            item = {k: data.get(k) for k in ("id", "scenario", "created_at", "result", "attempts")}
+            item["live"] = data["id"] in live_ids
+            items.append(item)
+            if len(items) >= 30:
+                break
+        return json_safe({"runs": items})
+
     @app.get("/api/runs")
     async def runs():
-        reports = sorted(config.output.glob("*/report.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:30]
-        items = []
-        for path in reports:
-            try:
-                data = json.loads(path.read_text())
-                item = {k: data.get(k) for k in ("id", "scenario", "created_at", "result", "attempts")}
-                item["live"] = data.get("id") in studio.sessions
-                items.append(item)
-            except (OSError, ValueError):
-                continue
-        return {"runs": items}
+        return await asyncio.to_thread(run_summaries, set(studio.sessions))
 
     @app.get("/api/runs/{identifier}")
     async def report(identifier: str):
@@ -514,17 +587,9 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/api/sample.png")
     async def sample():
-        browser = await studio.get_browser()
-        page = await browser.new_page(viewport={"width": 1280, "height": 720})
-        try:
-            await page.goto((ASSETS / "invoice.html").as_uri())
-            await page.evaluate("render('paid')")
-            png = await page.screenshot(animations="disabled")
-        finally:
-            await page.close()
         from fastapi.responses import Response
 
-        return Response(png, media_type="image/png")
+        return Response(await studio.sample_image(), media_type="image/png")
 
     @app.post("/api/ask")
     async def ask(options: AskOptions):
@@ -537,13 +602,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             if not options.statement.strip():
                 raise HTTPException(400, "请填写要判断的命题")
             try:
-                from PIL import Image
-
-                raw = base64.b64decode(options.image.split(",", 1)[1], validate=True)
-                with Image.open(io.BytesIO(raw)) as uploaded:
-                    if uploaded.width * uploaded.height > 16_000_000:
-                        raise ValueError("图片超过 1600 万像素，请缩小后上传")
-                    uploaded.verify()
+                await asyncio.to_thread(validate_upload, options.image)
             except Exception as exc:
                 raise HTTPException(400, f"无法读取图片：{exc}") from exc
             state = {"context": options.text, "image": "<image:1>"}
@@ -565,11 +624,15 @@ def create_app(config: Config | None = None) -> FastAPI:
         started = time.perf_counter()
         try:
             response = await asyncio.to_thread(studio.backend.client.system_one, state, questions, media=media)
+            answers = {k: v.raw for k, v in response.answers.items()}
+            # Invalid numeric answers are an upstream error. Diagnostics remain
+            # inspectable even when they include non-finite values.
+            json.dumps(answers, allow_nan=False)
         except (URLError, OSError, ValueError, KeyError, TypeError) as exc:
             raise HTTPException(502, "模型请求失败，请检查右上角的连接状态后重试") from exc
-        return {"model": response.model, "answers": {k: v.raw for k, v in response.answers.items()},
+        return json_safe({"model": response.model, "answers": answers,
                 "usage": response.usage, "meta": response.meta, "request_id": response.request_id,
-                "request_s": time.perf_counter() - started}
+                "request_s": time.perf_counter() - started})
 
     @app.exception_handler(Exception)
     async def failure(request, exc):

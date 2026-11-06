@@ -1,8 +1,10 @@
 import gc
+import hashlib
 import threading
 import weakref
 from contextlib import contextmanager
-from types import SimpleNamespace
+from dataclasses import replace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -30,6 +32,9 @@ class FakeEngine(DecisionEngine):
     def _encode(self, text):
         self.encodes += 1
         return list(text.encode())
+
+    def _encode_many(self, texts):
+        return [self._encode(text) for text in texts]
 
     def _render_prompt(self, state, suffix):
         return "\n".join(m["content"] for m in build_messages(state, suffix)) + "\nassistant:"
@@ -70,6 +75,40 @@ def test_debug_state_is_cleared_after_failure():
     assert engine.decide(request())[0].answers["ok"].noul == 0.5
 
 
+@pytest.mark.parametrize("layout", ["tagged", "json"])
+def test_structured_state_serializes_once_per_request_and_refreshes_after_mutation(monkeypatch, layout):
+    from qev.prompt import state_block
+
+    engine = FakeEngine()
+    engine.style = replace(DEFAULT_STYLE, layout=layout)
+    engine.template_kwargs = {}
+    engine.tokenizer = SimpleNamespace(apply_chat_template=lambda messages, **kwargs:
+                                      "\n".join(m["content"] for m in messages) + "\nassistant:")
+    engine._render_prompt = MethodType(DecisionEngine._render_prompt, engine)
+    calls = []
+
+    def serialize(state, style):
+        calls.append(state)
+        return state_block(state, style)
+
+    monkeypatch.setattr("qev.engine.state_block", serialize)
+    req = request(state={"nested": {"status": "未支付 QEV_PREFIX_MARK <image:1>"}})
+    expected = engine._render_prompt(req.state, render_question("ok", req.questions["ok"], style=engine.style).suffix)
+    _, first = engine.decide(req, debias=2)
+    assert len(calls) == 1
+    assert first["prompt_sha256"] == hashlib.sha256(expected.encode()).hexdigest()
+    assert engine._prepared_state is None
+    req.state["nested"]["status"] = "paid"
+    _, second = engine.decide(req)
+    assert len(calls) == 2
+    assert second["prompt_sha256"] != first["prompt_sha256"]
+    engine.fail = True
+    with pytest.raises(ValueError, match="forward failed"):
+        engine.decide(req)
+    assert engine._prepared_state is None
+    assert engine._prepared_ids is None
+
+
 def test_prefix_marker_in_state_does_not_shorten_shared_prefix():
     engine = FakeEngine()
     req = request(state="user text QEV_PREFIX_MARK and more state text")
@@ -87,6 +126,32 @@ def test_training_split_uses_the_same_boundary_with_literal_marker_in_state():
     prefix, suffixes = split_prefix(bundle, state, ["Question: first", "Question: second"])
     assert bytes(suffixes[0]).decode() == "Question: first\nassistant:"
     assert bytes(prefix).decode().endswith("</state>\n\n")
+
+
+@pytest.mark.parametrize("state", ["", "hello\n\n", "状态：支付完成。 café 👋", "literal QEV_PREFIX_MARK <image:1>"])
+def test_batch_planning_keeps_complete_token_streams_and_unequal_suffixes(state):
+    from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+    from transformers import PreTrainedTokenizerFast
+
+    raw = Tokenizer(models.BPE(unk_token="<unk>"))
+    raw.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    raw.train_from_iterator(["Question: Is the invoice paid? Options: yes no. Rate the state.", state],
+        trainer=trainers.BpeTrainer(vocab_size=400, initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                                   special_tokens=["<unk>", "<pad>", "<image:1>"]))
+    engine = FakeEngine()
+    engine.tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw, unk_token="<unk>", pad_token="<pad>")
+    engine._encode = MethodType(DecisionEngine._encode, engine)
+    engine._encode_many = MethodType(DecisionEngine._encode_many, engine)
+    req = request(state=state)
+    rendered = [render_question(key, question) for key, question in req.questions.items()]
+    prefix, suffixes = engine._prefix_and_suffix_ids(state, rendered)
+    assert len({len(suffix) for suffix in suffixes}) > 1
+    for question, suffix in zip(rendered, suffixes):
+        full = engine.tokenizer.encode(engine._render_prompt(state, question.suffix), add_special_tokens=False)
+        assert prefix + suffix == full
+    response, meta = engine.decide(req)
+    assert response.answers["ok"].noul == .5
+    assert meta["prefix_tokens"] == len(prefix)
 
 
 def test_chunked_choice_preserves_option_named_like_internal_none_slot():

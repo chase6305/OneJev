@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from qev.robot import RobotWorld, RobotController, RobotDemo
 from qev.robot_capture import ManagedCapture
@@ -78,3 +79,49 @@ class ManagedCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 5)
         self.assertGreaterEqual(len(set(clients)), 2)
         self.assertEqual(self.world.snapshot()["clients"], 0)
+
+    async def test_disconnect_during_a_render_retries_the_same_pose_with_a_new_renderer(self):
+        import asyncio
+
+        first = await self.capture.get_viewer()
+        render = first.get_render
+        loop = asyncio.get_running_loop()
+
+        def interrupted(**options):
+            asyncio.run_coroutine_threadsafe(self.capture.browser.close(), loop).result(timeout=5)
+            return render(**options)
+
+        first.get_render = interrupted
+        infer = Mock(return_value=SimpleNamespace(
+            model="test", answers={key: SimpleNamespace(raw={"type": "noul", "noul": .01})
+                                    for key in ("placed", "grasped")}, meta={}, usage={}))
+        controller = RobotController(self.world, SimpleNamespace(state="ready", client=SimpleNamespace(system_one=infer)), self.capture)
+        self.world.auto_running = True
+        try:
+            await asyncio.wait_for(controller.check_observation(automatic=True), timeout=30)
+        finally:
+            self.world.auto_running = False
+        self.assertEqual(self.world.revision, 0)
+        self.assertEqual(len(self.world.history), 1, self.world.error)
+        self.assertEqual(len(self.world.observation_errors), 1)
+        self.assertFalse(self.world.pending_observation)
+        self.assertNotEqual(self.capture.client_id, first.client_id)
+        self.assertEqual(self.capture.state["launches"], 2)
+        infer.assert_called_once()
+
+    async def test_first_private_frame_has_the_same_lighting_as_a_settled_frame(self):
+        import asyncio
+        from PIL import Image, ImageChops, ImageStat
+
+        viewer = await self.capture.get_viewer()
+        client = SimpleNamespace(system_one=Mock(return_value=SimpleNamespace(
+            model="test", answers={key: SimpleNamespace(raw={"type": "noul", "noul": .01})
+                                    for key in ("placed", "grasped")}, meta={}, usage={})))
+        first = await self.world.observe(client, viewer)
+        await asyncio.sleep(1)
+        settled = await self.world.observe(client, viewer)
+        with Image.open(self.world.path / first["image"].split("/")[-1]) as a, \
+                Image.open(self.world.path / settled["image"].split("/")[-1]) as b:
+            # Shadow accumulation may change a few pixels. An uninitialized
+            # environment instead darkens most of this fixed scene substantially.
+            self.assertLess(max(ImageStat.Stat(ImageChops.difference(a, b)).mean), 2)

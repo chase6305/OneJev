@@ -29,6 +29,11 @@ def test_training_targets_follow_permuted_labels():
         common.target_vector({"yes": 1}, ["other"])
 
 
+def test_large_finite_training_weights_are_normalized_without_overflow():
+    assert common.target_vector({"yes": 1e308, "no": 1e308}, ["yes", "no"]) == [.5, .5]
+    assert common.target_vector({"yes": 1e308, "no": 5e307}, ["no", "yes"]) == pytest.approx([1 / 3, 2 / 3])
+
+
 def test_padding_already_full_choice_keeps_question():
     row = {"state": "x", "task": "next_action", "question": {"type": "choice", "criteria": {str(i): str(i) for i in range(255)}}}
     question = common.pad_options(row, {"next_action:tools": [("extra", "another tool")]}, prob=1, seed=0)

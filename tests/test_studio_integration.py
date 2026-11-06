@@ -32,6 +32,14 @@ class StudioIntegrationTests(unittest.TestCase):
             def do_POST(self):
                 payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 self.server.requests.append(payload)
+                if self.server.truncate_next:
+                    self.server.truncate_next = False
+                    self.send_response(200)
+                    self.send_header("Content-Length", "100")
+                    self.end_headers()
+                    self.wfile.write(b'{"model":')
+                    self.close_connection = True
+                    return
                 if self.server.fail_next:
                     self.server.fail_next = False
                     self.send_json({"detail": "temporarily unavailable"}, status=503)
@@ -41,7 +49,7 @@ class StudioIntegrationTests(unittest.TestCase):
                     time.sleep(delay)
                 reply = self.server.replies.pop(0) if self.server.replies else {}
                 self.send_json({"model": "test-model", "answers": reply, "usage": {"input_tokens": 100, "output_tokens": 3},
-                                "onejev": {"timing": {"total_s": 0.01}}})
+                                "onejev": self.server.meta})
 
             def send_json(self, payload, status=200):
                 data = json.dumps(payload).encode()
@@ -54,6 +62,8 @@ class StudioIntegrationTests(unittest.TestCase):
         cls.model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
         cls.model.requests, cls.model.replies = [], []
         cls.model.fail_next = False
+        cls.model.truncate_next = False
+        cls.model.meta = {"timing": {"total_s": 0.01}}
         cls.model.delay_next = 0
         cls.thread = threading.Thread(target=cls.model.serve_forever, daemon=True)
         cls.thread.start()
@@ -94,6 +104,8 @@ class StudioIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.model.requests, self.model.replies = [], []
         self.model.fail_next = False
+        self.model.truncate_next = False
+        self.model.meta = {"timing": {"total_s": 0.01}}
         self.model.delay_next = 0
 
     def api(self, path, body=None, expected=200, binary=False):
@@ -197,6 +209,38 @@ class StudioIntegrationTests(unittest.TestCase):
         completed = self.step(identifier)
         self.assertEqual(completed["attempts"], 2)
         self.assertEqual(completed["result"], "verified")
+
+    def test_truncated_model_response_can_resume_without_repeating_payment(self):
+        self.model.replies = [answers(), answers("retry"), answers("paid", .98)]
+        identifier = self.create()
+        self.step(identifier)
+        self.model.truncate_next = True
+        failed = self.step(identifier)
+        self.assertTrue(failed["retryable"])
+        self.assertIsNone(failed["result"])
+        self.assertEqual(failed["attempts"], 1)
+        self.assertEqual(failed["history"][-1]["page_status"], "retry")
+        recovered = self.step(identifier)
+        self.assertEqual(recovered["attempts"], 1)
+        self.assertFalse(recovered["retryable"])
+        self.assertEqual(self.step(identifier)["result"], "verified")
+
+    def test_nonfinite_diagnostics_keep_browser_and_text_results_readable(self):
+        self.model.meta = {"mass": float("nan"), "bounds": [float("inf"), float("-inf")]}
+        self.model.replies = [answers(), {"completed": {"type": "noul", "noul": .97}}]
+        identifier = self.create()
+        state = self.step(identifier)
+        expected = {"mass": "NaN", "bounds": ["Infinity", "-Infinity"]}
+        self.assertIsNone(state["error"])
+        self.assertEqual(state["history"][-1]["meta"], expected)
+        self.assertEqual(self.api(f"/api/runs/{identifier}")["history"][-1]["meta"], expected)
+        reply = self.api("/api/ask", {"preset": "completion", "text": "问题已经解决。"})
+        self.assertEqual(reply["meta"], expected)
+        self.assertEqual(reply["answers"]["completed"]["noul"], .97)
+
+    def test_nonfinite_text_answer_returns_upstream_error(self):
+        self.model.replies = [{"completed": {"type": "noul", "noul": float("nan")}}]
+        self.api("/api/ask", {"preset": "completion", "text": "问题已经解决。"}, expected=502)
 
     def test_speed_change_interrupts_the_current_wait(self):
         self.model.replies = [answers(), answers("retry"), answers("paid", .98)]
@@ -610,6 +654,59 @@ class StudioIntegrationTests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_robot_late_archive_load_cannot_replace_a_newer_selection_or_live_view(self):
+        import importlib.util
+        from playwright.sync_api import sync_playwright
+
+        if importlib.util.find_spec("viser") is None:
+            self.skipTest("install the robot optional dependencies")
+        older = self.api("/api/robot/reset", {"scenario": "normal"})["id"]
+        newer = self.api("/api/robot/reset", {"scenario": "drop"})["id"]
+        current = self.api("/api/robot/reset", {"scenario": "normal"})["id"]
+        self.addCleanup(lambda: self.api("/api/robot/live", {}))
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True,
+                                                 args=["--enable-unsafe-swiftshader"])
+            try:
+                page = browser.new_page(viewport={"width": 1400, "height": 1000})
+                errors, held = [], []
+                page.on("pageerror", lambda error: errors.append(str(error)))
+                playlist = {"id": "c" * 32, "status": "stopped", "created_at": "2026-11-05T00:00:00Z",
+                            "items": [{"round": 1, "name": "历史案例", "status": "completed", "run_id": older,
+                                       "event_index": 0}], "index": 0}
+                page.route("**/api/robot/playlists", lambda route: route.fulfill(json={"playlists": [
+                    {"id": playlist["id"], "created_at": playlist["created_at"], "completed": 1, "total": 1}]}))
+                page.route("**/api/robot/playlists/" + playlist["id"], lambda route: route.fulfill(json=playlist))
+                page.goto(self.base + "/#robot")
+                page.wait_for_function('(id) => !!document.querySelector(`#robot-run option[value="${id}"]`)', arg=older)
+                page.route("**/api/robot/runs/" + older, lambda route: held.append(route))
+                for index, selection in enumerate((newer, "")):
+                    with self.subTest(selection=selection):
+                        page.locator("#robot-run").select_option(older)
+                        page.wait_for_timeout(50)
+                        self.assertEqual(len(held), index + 1)
+                        page.locator("#robot-run").select_option(selection)
+                        page.wait_for_function('(id) => document.getElementById("robot-report").getAttribute("href").endsWith(id)',
+                                               arg=selection or current)
+                        held[-1].fulfill(json=self.api("/api/robot/runs/" + older))
+                        page.wait_for_timeout(200)
+                        state = self.api("/api/robot")
+                        self.assertEqual(state["replay"]["run_id"] if state["replay"] else "", selection)
+                        self.assertEqual(page.locator("#robot-run").input_value(), selection)
+                page.locator("#robot-playlist-select").select_option(playlist["id"])
+                page.locator(f'[data-playlist-run="{older}"]').click()
+                page.wait_for_timeout(50)
+                self.assertEqual(len(held), 3)
+                page.locator("#robot-run").select_option(newer)
+                page.wait_for_function('(id) => document.getElementById("robot-report").getAttribute("href").endsWith(id)', arg=newer)
+                held[-1].fulfill(json=self.api("/api/robot/runs/" + older))
+                page.wait_for_timeout(200)
+                self.assertEqual(self.api("/api/robot")["replay"]["run_id"], newer)
+                self.assertFalse(errors)
+                self.assertFalse(self.model.requests)
+            finally:
+                browser.close()
+
     def test_robot_archived_replay_is_read_only_and_stale_controls_are_rejected(self):
         import importlib.util
 
@@ -787,6 +884,175 @@ class StudioIntegrationTests(unittest.TestCase):
                 page.locator("#image-statement").fill("图片里的发票仍然未付款。")
                 self.assertEqual(page.locator("#image-answers .answer-big").count(), 0)
                 self.assertIn("输入已更改", page.locator("#image-answers").inner_text())
+            finally:
+                browser.close()
+
+    def test_section_links_survive_reload_without_creating_a_browser_case(self):
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True)
+            try:
+                page = browser.new_page()
+                created = []
+                page.on("request", lambda request: created.append(request.url)
+                        if request.method == "POST" and request.url.endswith("/api/sessions") else None)
+                for tab in ("text", "image", "runs"):
+                    with self.subTest(tab=tab):
+                        page.goto(self.base + "/#" + tab)
+                        page.wait_for_function('document.body.dataset.modelState === "ready"')
+                        self.assertTrue(page.locator("#panel-" + tab).is_visible())
+                        page.reload()
+                        page.wait_for_function('document.body.dataset.modelState === "ready"')
+                        self.assertTrue(page.locator("#panel-" + tab).is_visible())
+                        self.assertTrue(page.url.endswith("#" + tab))
+                self.assertEqual(created, [])
+                page.locator('[data-tab="browser"]').click()
+                page.wait_for_function('document.getElementById("frame").naturalWidth > 0')
+                self.assertEqual(len(created), 1)
+            finally:
+                browser.close()
+
+    def test_late_text_success_or_error_does_not_replace_changed_input_notice(self):
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True)
+            try:
+                page = browser.new_page()
+                held = []
+                page.route("**/api/ask", lambda route: held.append(route))
+                page.goto(self.base)
+                page.locator('[data-tab="text"]').click()
+                for status in (200, 502):
+                    with self.subTest(status=status):
+                        held.clear()
+                        page.locator("#text-input").fill("这次判断使用的文本。")
+                        page.locator("#text-submit").click()
+                        page.wait_for_function('document.getElementById("text-form").dataset.busy === "1"')
+                        for _ in range(100):
+                            if held:
+                                break
+                            page.wait_for_timeout(10)
+                        self.assertEqual(len(held), 1)
+                        page.locator("#text-input").fill("请求尚未返回时换成了另一段文本。")
+                        held[0].fulfill(status=status, json={"model": "test", "answers": {}, "detail": "旧请求失败"})
+                        page.wait_for_function('document.getElementById("text-form").dataset.busy === "0"')
+                        self.assertIn("输入已更改", page.locator("#text-answers").inner_text())
+                        self.assertEqual(page.locator("#text-answers .inline-error").count(), 0)
+            finally:
+                browser.close()
+
+    def test_new_case_from_interrupted_history_does_not_pause_archived_session(self):
+        from playwright.sync_api import sync_playwright
+
+        identifier = "a" * 32
+        archived = {"id": identifier, "scenario": "retry", "created_at": "2026-11-01T00:00:00Z",
+                    "attempts": 0, "result": None, "busy": False, "auto_running": True, "history": []}
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True)
+            try:
+                page = browser.new_page()
+                pauses = []
+                page.on("request", lambda request: pauses.append(request.url) if request.url.endswith("/pause") else None)
+                page.route("**/api/runs", lambda route: route.fulfill(json={"runs": [archived]}))
+                page.route("**/api/runs/" + identifier, lambda route: route.fulfill(json=archived))
+                page.goto(self.base)
+                page.wait_for_function('document.getElementById("frame").naturalWidth > 0')
+                original = page.evaluate('localStorage.getItem("onejev-studio-session")')
+                page.locator('[data-tab="runs"]').click()
+                page.locator('[data-run="' + identifier + '"]').click()
+                page.wait_for_function('!document.getElementById("panel-browser").hidden')
+                page.locator("#reset").click()
+                page.wait_for_function('(old) => localStorage.getItem("onejev-studio-session") !== old', arg=original)
+                self.assertEqual(pauses, [])
+            finally:
+                browser.close()
+
+    def test_late_sample_image_cannot_replace_a_more_recent_upload(self):
+        import base64
+        import io
+        from PIL import Image
+        from playwright.sync_api import sync_playwright
+
+        def image_bytes(color):
+            stream = io.BytesIO()
+            Image.new("RGB", (8, 6), color).save(stream, format="PNG")
+            return stream.getvalue()
+
+        sample, upload = image_bytes("red"), image_bytes("blue")
+        expected = "data:image/png;base64," + base64.b64encode(upload).decode()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True)
+            try:
+                page = browser.new_page()
+                held, asked = [], []
+                page.route("**/api/sample.png", lambda route: held.append(route))
+                def answer(route):
+                    asked.append(route.request.post_data_json)
+                    route.fulfill(json={"model": "test", "answers": {"completed": {"type": "noul", "noul": .9}}})
+                page.route("**/api/ask", answer)
+                page.goto(self.base + "/#image")
+                page.locator("#image-sample").click()
+                for _ in range(100):
+                    if held:
+                        break
+                    page.wait_for_timeout(10)
+                self.assertEqual(len(held), 1)
+                page.locator("#image-file").set_input_files({"name": "blue.png", "mimeType": "image/png", "buffer": upload})
+                page.wait_for_function('(uri) => document.getElementById("image-preview").src === uri', arg=expected)
+                held[0].fulfill(body=sample, content_type="image/png")
+                page.wait_for_timeout(100)
+                self.assertEqual(page.locator("#image-preview").get_attribute("src"), expected)
+                page.locator("#image-submit").click()
+                page.wait_for_selector("#image-answers .answer-big")
+                self.assertEqual(asked[0]["image"], expected)
+            finally:
+                browser.close()
+
+    def test_image_reads_keep_latest_upload_and_block_submission_until_ready(self):
+        import base64
+        import io
+        from PIL import Image
+        from playwright.sync_api import sync_playwright
+
+        def png(color):
+            stream = io.BytesIO()
+            Image.new("RGB", (8, 6), color).save(stream, format="PNG")
+            return stream.getvalue()
+
+        first, latest = png("red"), png("blue")
+        expected = "data:image/png;base64," + base64.b64encode(latest).decode()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel=os.environ.get("QEV_BROWSER_CHANNEL"), headless=True)
+            try:
+                page = browser.new_page()
+                page.add_init_script('''
+                    const read = FileReader.prototype.readAsDataURL;
+                    window.heldImageReads = [];
+                    FileReader.prototype.readAsDataURL = function(blob) {
+                        const deliver = this.onload;
+                        this.onload = (event) => window.heldImageReads.push(() => deliver.call(this, event));
+                        read.call(this, blob);
+                    };
+                ''')
+                requests = []
+                page.on("request", lambda request: requests.append(request.url) if request.url.endswith("/api/ask") else None)
+                page.goto(self.base + "/#image")
+                page.wait_for_function('document.body.dataset.modelState === "ready"')
+                page.locator("#image-file").set_input_files({"name": "red.png", "mimeType": "image/png", "buffer": first})
+                page.wait_for_function('window.heldImageReads.length === 1')
+                self.assertTrue(page.locator("#image-submit").is_disabled())
+                page.locator("#image-form").evaluate('(form) => form.requestSubmit()')
+                page.locator("#image-file").set_input_files({"name": "blue.png", "mimeType": "image/png", "buffer": latest})
+                page.wait_for_function('window.heldImageReads.length === 2')
+                self.assertTrue(page.locator("#image-submit").is_disabled())
+                page.evaluate('window.heldImageReads[1]()')
+                self.assertEqual(page.locator("#image-preview").get_attribute("src"), expected)
+                self.assertFalse(page.locator("#image-submit").is_disabled())
+                page.evaluate('window.heldImageReads[0]()')
+                self.assertEqual(page.locator("#image-preview").get_attribute("src"), expected)
+                self.assertEqual(requests, [])
             finally:
                 browser.close()
 

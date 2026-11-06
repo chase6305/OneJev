@@ -25,7 +25,7 @@ from typing import Any
 from .answers import make_choice, make_noul, make_score
 from .calibrate import Calibration, softmax
 from .prompt import (DEFAULT_STYLE, LETTERS, MAX_SLOTS, PROMPT_VERSION, SLOT_LABELS, PromptStyle, RenderedQuestion,
-                     build_messages, render_question)
+                     build_messages, render_question, state_block)
 from .schema import ChoiceQuestion
 from .schema import Answer, SystemOneRequest, SystemOneResponse, Usage
 
@@ -36,6 +36,14 @@ NONE_DESCRIPTION = "The correct option is not among the options listed in this q
 HEAD_CHUNK_BYTES = 64 << 20
 GRAPH_SIZES = (64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048,
                2560, 3072, 3584, 4096)
+
+
+def _padded_suffixes(suffixes: list[list[int]], pad_id: int, width: int | None = None, device="cpu"):
+    """Build a complete token batch before copying it to its destination device."""
+    import torch
+
+    width = max(map(len, suffixes)) if width is None else width
+    return torch.tensor([s + [pad_id] * (width - len(s)) for s in suffixes], dtype=torch.long, device=device)
 
 
 @dataclass
@@ -210,11 +218,28 @@ class DecisionEngine:
         return ids
 
     def _render_prompt(self, state: Any, suffix: str) -> str:
-        return self.tokenizer.apply_chat_template(build_messages(state, suffix, self.style), tokenize=False,
+        return self.tokenizer.apply_chat_template(self._messages(state, suffix), tokenize=False,
                                                   add_generation_prompt=True, **self.template_kwargs)
+
+    def _messages(self, state: Any, suffix: str) -> list[dict[str, str]]:
+        prepared = getattr(self, "_prepared_state", None)
+        if prepared is None or prepared[0] is not state or prepared[1] is not self.style:
+            return build_messages(state, suffix, self.style)
+        return [{"role": "system", "content": self.style.system},
+                {"role": "user", "content": prepared[2] + suffix}]
 
     def _encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def _encode_many(self, texts: list[str]) -> list[list[int]]:
+        if not texts:
+            return []
+        if len(texts) == 1:
+            return [self._encode(texts[0])]
+        # The tokenizer can process independent full prompts together while the
+        # boundary check below still verifies their exact shared token prefix.
+        return self.tokenizer(texts, add_special_tokens=False, return_attention_mask=False,
+                              return_token_type_ids=False)["input_ids"]
 
     def _select_fork_mode(self) -> None:
         """Compare batched-fork logits with sequential logits on a small synthetic request."""
@@ -254,7 +279,7 @@ class DecisionEngine:
         prepared = getattr(self, "_prepared_ids", None)
         if prepared is not None and prepared[0] is state and prepared[1] is rendered:
             return prepared[2], prepared[3]
-        full = [self._encode(self._render_prompt(state, r.suffix)) for r in rendered]
+        full = self._encode_many([self._render_prompt(state, r.suffix) for r in rendered])
         prefix_text = self._render_prompt(state, "QEV_PREFIX_MARK")
         cut = prefix_text.rindex("QEV_PREFIX_MARK")
         prefix_ids = self._encode(prefix_text[:cut])
@@ -288,7 +313,7 @@ class DecisionEngine:
                 n = ids.shape[1]
                 pos = torch.arange(n, device=self.device).view(1, 1, n).expand(3, 1, n)
                 try:
-                    last = self._graphs(self.model.model.embed_tokens(ids), pos)
+                    last = self._graphs(lambda: self.model.model.embed_tokens(ids), pos)
                 except (RuntimeError, torch.OutOfMemoryError) as exc:
                     log.warning("CUDA graphs off after %s: %s", type(exc).__name__, exc)
                     self._graphs = None
@@ -335,6 +360,24 @@ class DecisionEngine:
         linear-attention layers (conv and recurrent states), which the generic
         `DynamicCache.batch_repeat_interleave` does not fork in transformers 5.17."""
         import torch
+        from transformers import cache_utils
+
+        layers = getattr(cache, "layers", None)
+        linear = getattr(cache_utils, "LinearAttentionLayer", None)
+        if (type(cache) is cache_utils.DynamicCache and not cache.offloading
+                and all(type(layer) in (cache_utils.DynamicLayer, cache_utils.DynamicSlidingWindowLayer, linear)
+                        for layer in layers)):
+            # Copy metadata with the final, independent batch tensors already in
+            # deepcopy's memo. Cloning each prefix tensor before repeating it
+            # would allocate and copy an extra full prefix for every chunk.
+            memo = {}
+            for layer in layers:
+                tensors = (list(layer.conv_states.values()) + list(layer.recurrent_states.values())
+                           if type(layer) is linear else [layer.keys, layer.values])
+                for tensor in tensors:
+                    if torch.is_tensor(tensor) and id(tensor) not in memo:
+                        memo[id(tensor)] = tensor.repeat_interleave(n, dim=0)
+            return copy.deepcopy(cache, memo)
 
         forked = copy.deepcopy(cache)
         layers = getattr(forked, "layers", None)
@@ -395,20 +438,16 @@ class DecisionEngine:
         dev = self.device
         sufs = [suffixes[i] for i in idx]
         width = max(len(s) for s in sufs)
-        ids = torch.full((len(idx), width), self.pad_id, dtype=torch.long)
-        mask = torch.zeros((len(idx), P + width), dtype=torch.long)
-        pos = torch.zeros((len(idx), width), dtype=torch.long)
-        ends = []
-        for row, s in enumerate(sufs):
-            ids[row, : len(s)] = torch.tensor(s)
-            mask[row, : P + len(s)] = 1
-            pos[row, : len(s)] = torch.arange(P, P + len(s))
-            ends.append(len(s) - 1)
+        ids = _padded_suffixes(sufs, self.pad_id)
+        lengths = torch.tensor([len(s) for s in sufs])
+        mask = (torch.arange(P + width)[None] < P + lengths[:, None]).long()
+        pos = torch.arange(P, P + width)[None].expand(len(idx), -1).masked_fill(
+            torch.arange(width)[None] >= lengths[:, None], 0)
         cache = self._fork(base, len(idx))
         try:
             o = self.model.model(input_ids=ids.to(dev), attention_mask=mask.to(dev), position_ids=pos.to(dev),
                                  past_key_values=cache, use_cache=True, return_dict=True)
-            last = o.last_hidden_state[torch.arange(len(idx), device=dev), torch.tensor(ends, device=dev)]
+            last = o.last_hidden_state[torch.arange(len(idx), device=dev), (lengths - 1).to(dev)]
             outs = self._readout_rows(last, [rendered[i].n_slots for i in idx])
             for row, i in enumerate(idx):
                 r = rendered[i]
@@ -443,11 +482,16 @@ class DecisionEngine:
         the option order (all sharing the same prefix)."""
         with self._lock, self._device_context():
             self._prepared_ids = None
+            self._prepared_state = None
             self._want_mass = debug
             try:
+                # Every branch sees the same state block; serialize structured
+                # evidence once, and retain it only while this request runs.
+                self._prepared_state = (request.state, self.style, state_block(request.state, self.style))
                 return self._decide(request, debias, debug)
             finally:
                 self._prepared_ids = None
+                self._prepared_state = None
                 self._want_mass = False
 
     def _decide(self, request: SystemOneRequest, debias: int, debug: bool) -> tuple[SystemOneResponse, dict[str, Any]]:

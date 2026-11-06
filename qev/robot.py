@@ -12,6 +12,7 @@ import json
 import math
 import os
 import time
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -24,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from .browser import probability
 from .client import Choice, Noul
+from .reporting import json_safe, recent_reports
 
 PHASES = {"ready": "等待开始", "hover": "已靠近物体", "grasped": "夹爪已闭合", "lifted": "已抬起", "dropped": "物体掉落", "placed": "已放置", "complete": "动作结束"}
 SKILLS = {"approach": "靠近方块", "grasp": "闭合夹爪", "lift": "抬起方块", "place": "放入托盘", "recover": "重新抓取", "retreat": "收回机械臂"}
@@ -34,6 +36,18 @@ SCENARIOS = {
     "drop": {"name": "掉落后恢复", "description": "抓住并抬起后模拟一次掉落；观察机械臂重新抓取并完成放置。", "fault": "drop", "phase": "lifted"},
     "shift": {"name": "目标移动", "description": "抬起方块后移动托盘；后续放置使用新的目标位置。", "fault": "shift", "phase": "lifted"},
 }
+
+
+def save_capture(frame, path: Path) -> str:
+    """Save and send the same lossless pixels without blocking the event loop."""
+    from PIL import Image
+
+    stream = io.BytesIO()
+    with Image.fromarray(frame) as image:
+        image.save(stream, format="PNG", compress_level=3)
+    png = stream.getvalue()
+    path.write_bytes(png)
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
 
 
 def agreement(record):
@@ -77,9 +91,11 @@ def reconcile_playlists(root: Path):
     for path in (root / "playlists").glob("*/report.json"):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            if data.get("status") not in ("running", "paused"):
+            if not isinstance(data, dict) or data.get("status") not in ("running", "paused"):
                 continue
             owner = data.get("owner", {})
+            if not isinstance(owner, dict):
+                continue
             pid = int(owner.get("pid", -1))
             alive = False
             if pid > 0:
@@ -157,7 +173,19 @@ class RobotWorld:
         self.root.mkdir(parents=True, exist_ok=True)
         self.kinematics = Kinematics()
         self.server = viser.ViserServer(host="127.0.0.1", port=0, label="OneJev · Robot Lab", verbose=False)
+        try:
+            self._initialize_scene()
+        except BaseException:
+            self.server.stop()
+            raise
+
+    def _initialize_scene(self):
+        np = self.np
         self.server.scene.set_up_direction("+z")
+        # Environment-map decoding can leave the first observation unlit.
+        # Fixed fill and the default key lights are ready with the scene itself.
+        self.server.scene.configure_environment_map(None)
+        self.server.scene.add_light_ambient("/lighting/fill", intensity=3.)
         self.server.gui.configure_theme(show_logo=False, show_share_button=False, brand_color=(25, 99, 79))
         self.server.gui.main_panel.minimize()
         self.server.initial_camera.position = (.95, -1.15, .90)
@@ -256,7 +284,7 @@ class RobotWorld:
         return await self.execute()
 
     def snapshot(self):
-        return {"id": self.id, "phase": self.phase, "phase_label": PHASES[self.phase],
+        return json_safe({"id": self.id, "phase": self.phase, "phase_label": PHASES[self.phase],
                 "next_skill": self.next_skill(), "busy": self.busy, "attached": self.attached,
                 "miss_next": self.miss_next, "truth": self.truth(), "revision": self.revision,
                 "judged_revision": self.judged_revision, "history": self.history, "error": self.error,
@@ -272,7 +300,7 @@ class RobotWorld:
                 "capture": self.capture, "activity": self.activity,
                 "next_step_at": self.next_step_at, "pause_reason": self.pause_reason,
                 "next_action": self.next_action(), "scenario": {"key": self.scenario,
-                    **SCENARIOS[self.scenario], "fault_done": self.scenario_fault_done}}
+                    **SCENARIOS[self.scenario], "fault_done": self.scenario_fault_done}})
 
     def viewers(self):
         ready = {}
@@ -454,7 +482,6 @@ class RobotWorld:
         self.record_event("fault", FAULTS[kind], time.perf_counter() - started)
 
     async def observe(self, client, viewer=None):
-        from PIL import Image
         from scipy.spatial.transform import Rotation
 
         self.last_capture = None
@@ -474,13 +501,18 @@ class RobotWorld:
         self.server.flush()
         viewer = viewer or list(clients.values())[self.viewer_cursor % len(clients)]
         self.viewer_cursor += 1
-        frame = await asyncio.to_thread(viewer.get_render, height=720, width=960, position=position,
-                                        wxyz=quaternion, fov=.76, transport_format="jpeg", timeout=15)
-        stream = io.BytesIO()
-        Image.fromarray(frame).save(stream, format="PNG")
+        try:
+            frame = await asyncio.to_thread(viewer.get_render, height=720, width=960, position=position,
+                                            wxyz=quaternion, fov=.76, transport_format="jpeg", timeout=15)
+        except RuntimeError as exc:
+            # Viser reports disconnects and failed frame decoding as RuntimeError.
+            # Classify only this capture boundary as transport failure so the
+            # controller can reconnect and observe the same pose once more.
+            raise ConnectionError(f"相机画面读取失败：{exc}") from exc
+        self.set_activity("capture_save", "正在保存相机画面")
         filename = f"{self.capture_count:04d}.png"
         self.capture_count += 1
-        (self.path / filename).write_bytes(stream.getvalue())
+        image_data = await asyncio.to_thread(save_capture, frame, self.path / filename)
         self.last_capture = f"/api/robot/runs/{self.id}/{filename}"
         capture_s = time.perf_counter() - captured_at
         self.set_activity("inference", "模型视觉判断")
@@ -490,7 +522,7 @@ class RobotWorld:
             {"placed": Noul("The red cube is inside the blue tray and has been released by the gripper."),
              "grasped": Noul("The red cube is held between the gripper fingers and lifted above the table."),
              "location": Choice("Where is the red cube?", {"table": "On the table outside the blue tray", "gripper": "In the robot gripper, lifted above the table", "tray": "Inside the blue tray"})},
-            media=[{"type": "image", "data": "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode()}],
+            media=[{"type": "image", "data": image_data}],
         )
         answers = {k: v.raw for k, v in response.answers.items()}
         for key in ("placed", "grasped"):
@@ -551,13 +583,14 @@ class RobotReplay(RobotControl):
 class RobotController:
     """One executor per shared scene, independent of browser tabs and their timers."""
 
-    def __init__(self, live, backend, capture=None):
+    def __init__(self, live, backend, capture=None, *, reconcile=True):
         self.live, self.backend = live, backend
         self.capture = capture
         self.auto_task = None
         self.wake = asyncio.Event()
         self.finalizing_playlist = None
-        reconcile_playlists(live.root)
+        if reconcile:
+            reconcile_playlists(live.root)
 
     def save_playlist(self):
         playlist = self.live.playlist
@@ -866,32 +899,61 @@ class RobotController:
     async def close(self):
         self.live.auto_running = False
         self.wake.set()
-        if self.auto_task:
-            await self.auto_task
-        if self.capture:
-            await self.capture.close()
-        await asyncio.to_thread(self.live.close)
+        async with AsyncExitStack() as resources:
+            resources.push_async_callback(asyncio.to_thread, self.live.close)
+            if self.capture:
+                resources.push_async_callback(self.capture.close)
+            if self.auto_task:
+                await self.auto_task
 
 
 def install_routes(app, studio):
     """Lazy optional integration; base Studio does not import robotics dependencies."""
-    holder = {"world": None, "controller": None}
+    holder = {"world": None, "controller": None, "startup": None, "closing": False}
     start_lock = asyncio.Lock()
+
+    async def initialize():
+        live = None
+        try:
+            live = await asyncio.to_thread(RobotWorld, studio.config.output)
+            from .robot_capture import ManagedCapture
+            capture = ManagedCapture(live, studio.config.channel)
+            await asyncio.to_thread(reconcile_playlists, live.root)
+            control = RobotController(live, studio.backend, capture, reconcile=False)
+            holder["world"], holder["controller"] = live, control
+            return live
+        except BaseException:
+            if live is not None:
+                await asyncio.to_thread(live.close)
+            raise
+
+    def initialization_finished(task):
+        # Keep failures observed even if the initiating viewer disconnected.
+        if not task.cancelled():
+            task.exception()
 
     async def world():
         async with start_lock:
-            if holder["world"] is None:
-                try:
-                    holder["world"] = await asyncio.to_thread(RobotWorld, studio.config.output)
-                    from .robot_capture import ManagedCapture
-                    capture = ManagedCapture(holder["world"], studio.config.channel)
-                    holder["controller"] = RobotController(holder["world"], studio.backend, capture)
-                except ImportError as exc:
-                    raise HTTPException(503, "请先安装机器人展示支持：pip install -e '.[robot]'") from exc
-            return holder["world"]
+            if holder["closing"]:
+                raise HTTPException(503, "机器人工作台正在关闭")
+            if holder["world"] is not None:
+                return holder["world"]
+            if holder["startup"] is None or holder["startup"].done():
+                holder["startup"] = asyncio.create_task(initialize())
+                holder["startup"].add_done_callback(initialization_finished)
+            startup = holder["startup"]
+        try:
+            # Initializing the shared scene belongs to Studio, so cancelling a
+            # single HTTP request must not abandon a running constructor thread.
+            return await asyncio.shield(startup)
+        except ImportError as exc:
+            raise HTTPException(503, "请先安装机器人展示支持：pip install -e '.[robot]'") from exc
 
     async def close():
-        if holder["world"] is not None:
+        holder["closing"] = True
+        if holder["startup"] is not None:
+            await asyncio.gather(holder["startup"], return_exceptions=True)
+        if holder["controller"] is not None:
             await holder["controller"].close()
 
     studio.close_robot = close
@@ -992,20 +1054,22 @@ def install_routes(app, studio):
     async def stop(options: RobotControl):
         return (await controller()).stop(options)
 
-    @app.get("/api/robot/playlists")
-    async def playlists():
-        live = await world()
+    def playlist_summaries(root):
         reports = []
-        for path in sorted((live.root / "playlists").glob("*/report.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        for report in recent_reports(root):
             try:
-                report = read_report(live.root / "playlists", path.parent.name)
                 reports.append({"id": report["id"], "created_at": report["created_at"], "status": report["status"],
                                 "completed": sum(i["status"] == "completed" for i in report["items"]), "total": len(report["items"])})
-            except (HTTPException, KeyError, TypeError):
+            except (KeyError, TypeError):
                 continue
             if len(reports) >= 100:
                 break
-        return {"playlists": reports}
+        return json_safe({"playlists": reports})
+
+    @app.get("/api/robot/playlists")
+    async def playlists():
+        live = await world()
+        return await asyncio.to_thread(playlist_summaries, live.root / "playlists")
 
     @app.get("/api/robot/playlists/{identifier}")
     async def playlist_report(identifier: str):
@@ -1026,22 +1090,24 @@ def install_routes(app, studio):
     async def resume_live(options: RobotControl):
         return await (await controller()).resume_live(options)
 
-    @app.get("/api/robot/runs")
-    async def runs():
-        live = await world()
+    def run_summaries(root):
         reports = []
-        for path in sorted(live.root.glob("*/report.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        for report in recent_reports(root):
             try:
-                report = read_report(live.root, path.parent.name)
                 reports.append({"id": report["id"], "created_at": report.get("created_at"),
                                 "phase_label": report["phase_label"], "events": len(report.get("events", [])),
                                 "checks": len(report.get("history", [])),
                                 "scenario": report.get("scenario", {}).get("name", "自由演示")})
-            except (HTTPException, KeyError, TypeError):
+            except (KeyError, TypeError, AttributeError):
                 continue
             if len(reports) >= 100:
                 break
-        return {"runs": reports}
+        return json_safe({"runs": reports})
+
+    @app.get("/api/robot/runs")
+    async def runs():
+        live = await world()
+        return await asyncio.to_thread(run_summaries, live.root)
 
     @app.get("/api/robot/runs/{identifier}")
     async def report(identifier: str):

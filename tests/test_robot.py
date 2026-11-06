@@ -4,14 +4,148 @@ import asyncio
 import copy
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 from qev.robot import Kinematics, RobotWorld, RobotController, RobotControl, RobotPlayback, RobotDemo, RobotReplay, read_report, reconcile_playlists, process_owner
 
 HAS_ROBOT = all(importlib.util.find_spec(name) is not None for name in ("viser", "scipy", "numpy"))
+
+
+class RobotLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(HAS_ROBOT, "install the robot optional dependencies")
+    async def test_failed_world_setup_releases_its_already_started_server(self):
+        import socket
+        import viser
+
+        server = viser.ViserServer(host="127.0.0.1", port=0, verbose=False)
+        port = server.get_port()
+        original = server.stop
+        server.stop = Mock(wraps=original)
+        try:
+            with tempfile.TemporaryDirectory() as root, patch("viser.ViserServer", return_value=server), \
+                    patch.object(RobotWorld, "reset", side_effect=OSError("report disk unavailable")):
+                with self.assertRaisesRegex(OSError, "report disk unavailable"):
+                    RobotWorld(Path(root))
+            server.stop.assert_called_once()
+            with socket.socket() as probe:
+                probe.settimeout(.5)
+                self.assertNotEqual(probe.connect_ex(("127.0.0.1", port)), 0)
+        finally:
+            if not server.stop.called:
+                original()
+
+    async def test_close_waits_for_unattended_initialization_and_prevents_late_restart(self):
+        from qev.studio import Config, create_app
+
+        started, release = threading.Event(), threading.Event()
+        with tempfile.TemporaryDirectory() as root:
+            app = create_app(Config(output=Path(root), autostart=False))
+            endpoint = next(route.endpoint for route in app.routes if route.path == "/api/robot")
+            live = SimpleNamespace(root=Path(root) / "robot", auto_running=False, close=Mock(), snapshot=Mock())
+
+            def create(_output):
+                started.set()
+                release.wait(timeout=2)
+                return live
+
+            with patch("qev.robot.RobotWorld", side_effect=create) as constructor:
+                request = asyncio.create_task(endpoint())
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+                closing = asyncio.create_task(app.state.studio.close())
+                try:
+                    await asyncio.sleep(.02)
+                    self.assertFalse(closing.done())
+                finally:
+                    release.set()
+                    await closing
+                with self.assertRaises(HTTPException) as error:
+                    await endpoint()
+                self.assertEqual(error.exception.status_code, 503)
+                constructor.assert_called_once()
+                live.close.assert_called_once()
+
+    async def test_failed_controller_setup_closes_partial_world_and_retries_cleanly(self):
+        from qev.studio import Config, create_app
+
+        with tempfile.TemporaryDirectory() as root:
+            app = create_app(Config(output=Path(root), autostart=False))
+            endpoint = next(route.endpoint for route in app.routes if route.path == "/api/robot")
+            first, second = [SimpleNamespace(root=Path(root) / name, auto_running=False, close=Mock(),
+                snapshot=Mock(return_value={"id": name})) for name in ("first", "second")]
+            attempts = 0
+
+            def controller(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("controller setup failed")
+                return RobotController(*args, **kwargs)
+
+            with patch("qev.robot.RobotWorld", side_effect=[first, second]) as constructor, \
+                    patch("qev.robot.RobotController", side_effect=controller):
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "controller setup failed"):
+                        await endpoint()
+                    first.close.assert_called_once()
+                    self.assertEqual(await endpoint(), {"id": "second"})
+                    self.assertEqual(constructor.call_count, 2)
+                finally:
+                    await app.state.studio.close()
+                second.close.assert_called_once()
+
+    async def test_cancelled_playback_and_capture_close_errors_still_release_world(self):
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled), tempfile.TemporaryDirectory() as root:
+                live = SimpleNamespace(root=Path(root), auto_running=False, close=Mock())
+                capture = SimpleNamespace(close=AsyncMock(side_effect=None if cancelled else RuntimeError("capture failed")))
+                controller = RobotController(live, SimpleNamespace(), capture)
+                if cancelled:
+                    controller.auto_task = asyncio.create_task(asyncio.sleep(60))
+                    controller.auto_task.cancel()
+                    await asyncio.gather(controller.auto_task, return_exceptions=True)
+                with self.assertRaises(asyncio.CancelledError if cancelled else RuntimeError):
+                    await controller.close()
+                capture.close.assert_awaited_once()
+                live.close.assert_called_once()
+
+    async def test_cancelled_first_viewer_does_not_restart_or_orphan_world_initialization(self):
+        from qev.studio import Config, create_app
+
+        started, release = threading.Event(), threading.Event()
+        with tempfile.TemporaryDirectory() as root:
+            app = create_app(Config(output=Path(root), autostart=False))
+            endpoint = next(route.endpoint for route in app.routes if route.path == "/api/robot")
+            live = SimpleNamespace(root=Path(root) / "robot", auto_running=False, close=Mock(),
+                                   snapshot=Mock(return_value={"id": "robot"}))
+
+            def create(_output):
+                started.set()
+                release.wait(timeout=2)
+                return live
+
+            with patch("qev.robot.RobotWorld", side_effect=create) as constructor:
+                first = asyncio.create_task(endpoint())
+                second = None
+                try:
+                    self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                    first.cancel()
+                    await asyncio.gather(first, return_exceptions=True)
+                    second = asyncio.create_task(endpoint())
+                    await asyncio.sleep(.05)
+                    self.assertEqual(constructor.call_count, 1)
+                finally:
+                    release.set()
+                    await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+                    await app.state.studio.close()
+                self.assertEqual(second.result(), {"id": "robot"})
+                live.close.assert_called_once()
 
 
 @unittest.skipUnless(HAS_ROBOT, "install the robot optional dependencies")
@@ -36,6 +170,14 @@ class KinematicsTests(unittest.TestCase):
 
 
 class PlaylistJournalTests(unittest.TestCase):
+    def test_invalid_journal_shapes_do_not_block_startup_reconciliation(self):
+        with tempfile.TemporaryDirectory() as root:
+            for key, payload in (("a", []), ("b", {"status": "running", "owner": []}), ("c", None)):
+                path = Path(root) / "playlists" / (key * 32) / "report.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(payload))
+            reconcile_playlists(Path(root))
+
     def test_only_abandoned_active_journals_are_marked_interrupted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -109,6 +251,74 @@ class RobotSkillTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.world.truth()["placed"])
         self.assertFalse(self.world.attached)
 
+    async def test_slow_capture_save_leaves_scene_responsive_and_sends_the_saved_pixels(self):
+        import base64
+        import io
+        from PIL import Image
+
+        frame = self.world.np.arange(12 * 16 * 3, dtype=self.world.np.uint8).reshape(12, 16, 3)
+        viewer = SimpleNamespace(get_render=Mock(return_value=frame))
+        self.world.viewers = lambda: {1: viewer}
+        answer = SimpleNamespace(model="test", answers={key: SimpleNamespace(raw={"type": "noul", "noul": .01})
+                                 for key in ("placed", "grasped")}, usage={}, meta={})
+        client = SimpleNamespace(system_one=Mock(return_value=answer))
+        writing, release = threading.Event(), threading.Event()
+        original = Path.write_bytes
+
+        def write(path, content):
+            if path.suffix == ".png":
+                writing.set()
+                release.wait(timeout=2)
+            return original(path, content)
+
+        with patch.object(Path, "write_bytes", write):
+            observing = asyncio.create_task(self.world.observe(client, viewer))
+            try:
+                self.assertTrue(await asyncio.to_thread(writing.wait, 1))
+                self.assertFalse(observing.done())
+                self.assertEqual(self.world.snapshot()["activity"]["kind"], "capture_save")
+                client.system_one.assert_not_called()
+            finally:
+                release.set()
+                record = await observing
+        saved = (self.world.path / record["image"].split("/")[-1]).read_bytes()
+        encoded = client.system_one.call_args.kwargs["media"][0]["data"]
+        self.assertEqual(base64.b64decode(encoded.split(",", 1)[1]), saved)
+        with Image.open(io.BytesIO(saved)) as image:
+            self.world.np.testing.assert_array_equal(self.world.np.array(image), frame)
+
+    async def test_temporary_capture_save_failure_retries_without_rebuilding_the_camera(self):
+        viewer = SimpleNamespace(get_render=Mock(return_value=self.world.np.zeros((8, 8, 3), dtype="uint8")))
+        self.world.viewers = lambda: {1: viewer}
+        self.controller.capture = SimpleNamespace(get_viewer=AsyncMock(return_value=viewer), invalidate=AsyncMock(), close=AsyncMock())
+        answer = SimpleNamespace(model="test", answers={key: SimpleNamespace(raw={"type": "noul", "noul": .01})
+                                 for key in ("placed", "grasped")}, usage={}, meta={})
+        self.controller.backend.client = SimpleNamespace(system_one=Mock(return_value=answer))
+        original = Path.write_bytes
+        failed = False
+
+        def write(path, content):
+            nonlocal failed
+            if path.suffix == ".png" and not failed:
+                failed = True
+                raise OSError("temporary capture storage failure")
+            return original(path, content)
+
+        self.world.auto_running = True
+        try:
+            with patch.object(Path, "write_bytes", write):
+                await self.controller.check_observation(automatic=True)
+        finally:
+            self.world.auto_running = False
+        self.controller.capture.invalidate.assert_not_called()
+        self.assertEqual(self.controller.capture.get_viewer.await_count, 2)
+        self.controller.backend.client.system_one.assert_called_once()
+        self.assertEqual(self.world.revision, 0)
+        self.assertEqual(len(self.world.history), 1)
+        self.assertEqual(len(self.world.observation_errors), 1)
+        self.assertTrue(self.world.last_capture.endswith("0001.png"))
+        self.assertFalse(self.world.pending_observation)
+
     async def test_missed_grasp_is_detected_and_can_be_recovered(self):
         await self.world.inject("miss")
         for _ in range(3):
@@ -165,6 +375,16 @@ class RobotSkillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["events"][-1]["pose"]["phase"], "hover")
         self.assertNotEqual(report["events"][0]["pose"]["q"], report["events"][-1]["pose"]["q"])
         self.assertFalse((self.world.path / "report.tmp").exists())
+
+    async def test_nonfinite_diagnostics_cannot_block_robot_report_persistence(self):
+        self.world.history.append({"revision": self.world.revision, "truth": self.world.truth(),
+            "answers": {"placed": {"noul": .01}, "grasped": {"noul": .01}},
+            "meta": {"mass": float("nan"), "range": [float("inf"), float("-inf")]}})
+        self.world.save()
+        saved = read_report(self.world.root, self.world.id)
+        expected = {"mass": "NaN", "range": ["Infinity", "-Infinity"]}
+        self.assertEqual(saved["history"][0]["meta"], expected)
+        self.assertEqual(self.world.snapshot()["history"][0]["meta"], expected)
 
     async def test_stale_tab_cannot_execute_another_skill_or_reset_a_new_run(self):
         stale = RobotControl(run_id=self.world.id, expected_revision=0)

@@ -60,9 +60,11 @@ def target_vector(target: dict[str, float], labels: Sequence[str]) -> list[float
     vec = [float(target.get(lbl, 0.0)) for lbl in labels]
     if any(not math.isfinite(v) or v < 0 for v in vec):
         raise ValueError("target probabilities must be finite and non-negative")
-    total = sum(vec)
-    if total <= 0:
+    scale = max(vec, default=0.0)
+    if scale <= 0:
         raise ValueError(f"target {target} has no mass on the rendered labels {list(labels)}")
+    vec = [v / scale for v in vec]
+    total = sum(vec)
     return [v / total for v in vec]
 
 

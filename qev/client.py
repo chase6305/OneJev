@@ -11,7 +11,9 @@ import json
 import os
 import urllib.request
 from dataclasses import dataclass, field
+from http.client import HTTPException as HTTPProtocolError
 from typing import Any
+from urllib.error import URLError
 from urllib.parse import urlencode
 
 
@@ -89,13 +91,20 @@ class Client:
         req = urllib.request.Request(self.base_url + path, data=json.dumps(body).encode(), method="POST",
                                      headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}",
                                               "User-Agent": "qev-client"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            return json.loads(resp.read()), dict(resp.headers)
+        return self._request(req)
 
     def _get(self, path: str) -> dict[str, Any]:
         req = urllib.request.Request(self.base_url + path, headers={"Authorization": f"Bearer {self.api_key}", "User-Agent": "qev-client"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            return json.loads(resp.read())
+        return self._request(req)[0]
+
+    def _request(self, request: urllib.request.Request) -> tuple[dict[str, Any], dict[str, str]]:
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+                return json.loads(resp.read()), dict(resp.headers)
+        except HTTPProtocolError as exc:
+            # A server restart can truncate a response after the headers arrive.
+            # Callers already treat URLError as retryable without repeating actions.
+            raise URLError(exc) from exc
 
     def system_one(self, state: Any, questions: dict[str, Any], model: str | None = None,
                    media: list[dict] | None = None, **params: Any) -> Response:
@@ -109,6 +118,10 @@ class Client:
         if media is not None:
             body["media"] = media
         data, headers = self._post(path, body)
+        if (not isinstance(data, dict) or not isinstance(data.get("model"), str)
+                or not isinstance(data.get("answers"), dict)
+                or any(not isinstance(answer, dict) for answer in data["answers"].values())):
+            raise ValueError("invalid System One response: expected a model name and answer objects")
         headers = {k.lower(): v for k, v in headers.items()}
         return Response(model=data["model"], answers={k: _Answer(v) for k, v in data["answers"].items()},
                         usage=data.get("usage", {}), request_id=headers.get("x-typesafe-request-id"),

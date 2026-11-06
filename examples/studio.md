@@ -2,6 +2,8 @@
 
 一个持续运行的本地交互网站，整合浏览器任务、文本判断、图片判断、机器人展示和运行记录。
 案例和模型状态都在网页里管理，日常只需要一个启动入口。
+可直接打开 `/#text`、`/#image`、`/#robot` 或 `/#runs`，刷新后仍停留在对应功能页。
+进入浏览器任务时才会按需创建新的浏览器案例。
 
 ## 启动
 
@@ -60,12 +62,15 @@ qev studio --backend-url http://model-host:8000 --no-autostart
 
 **图片理解**：上传 PNG、JPG 或 WebP，填写想确认的命题。也可以点击
 “先用案例截图试一下”，判断发票是否已付款。图片上限 10 MB、1600 万像素。
+图片校验在后台完成，读取图片时仍可查询连接状态。
 
 修改文本、命题或替换图片后，旧结果会标记为需要重新判断，避免把先前的结果
-与新的输入混在一起。
+与新的输入混在一起。图片按最后一次选择加载，读取期间暂停提交；旧请求返回的
+结果或错误也不会覆盖新输入的提示。
 
 **运行记录**：浏览最近 30 次浏览器案例，逐步回放截图与原始模型输出。
 记录保存在本地，重启网站后仍可回看；重启前正在进行的案例需要重新开始。
+列表会跳过损坏或已删除的报告；读取历史记录时，状态查询和其他操作仍可继续。
 
 ## 结果与生命周期
 
@@ -75,8 +80,12 @@ qev studio --backend-url http://model-host:8000 --no-autostart
 
 这些是演示阈值，不能直接当作业务准确率。文本和图片判断返回模型概率，
 其中没有发票演示的页面真实状态校验。
+原始结果中的非有限诊断值会以 `"NaN"`、`"Infinity"` 或 `"-Infinity"` 字符串保留，
+避免诊断字段影响报告保存和回放；文本与图片判断中的非有限答案会返回模型响应错误。
 
 网站只管理由自己启动的模型进程；复用外部服务时不会在退出网站时停止它。
+服务已响应但健康状态异常时会继续探测，不会因此启动第二个本地模型进程。
+退出时会等待正在进行的重连和场景初始化结束，再清理所管理的资源。
 关闭启动网站的终端或按 Ctrl+C 会结束网站；想持续运行时，可使用你常用的
 进程管理工具管理同一条 `qev studio` 命令。
 
@@ -86,11 +95,12 @@ qev studio --backend-url http://model-host:8000 --no-autostart
 ## 验证
 
 ```bash
-# 单元检查
-python -m unittest discover -s tests -v
+# 安装检查依赖并运行 Studio 基础回归
+pip install -e '.[dev,browser]'
+python -m pytest -q tests/test_studio.py tests/test_studio_integration.py
 
 # 包括真实 Chrome、本地 HTTP 与可复现模型响应的集成检查，无需 GPU
-QEV_BROWSER_TESTS=1 QEV_BROWSER_CHANNEL=chrome python -m unittest discover -s tests -v
+QEV_BROWSER_TESTS=1 QEV_BROWSER_CHANNEL=chrome python -m pytest -q tests/test_studio.py tests/test_studio_integration.py
 ```
 
 ## English

@@ -26,7 +26,7 @@ from typing import Any
 from . import media as mmedia
 from .calibrate import Calibration
 from .engine import BranchResult, DecisionEngine, EngineInfo
-from .prompt import DEFAULT_STYLE, PROMPT_VERSION, PromptStyle, RenderedQuestion, build_messages
+from .prompt import DEFAULT_STYLE, PROMPT_VERSION, PromptStyle, RenderedQuestion
 from .schema import SystemOneRequest, SystemOneResponse
 
 log = logging.getLogger("qev.llamacpp")
@@ -208,7 +208,7 @@ class LlamaCppEngine(DecisionEngine):
             raise ValueError("the GGUF vocabulary does not match the OneJev tokenizer; pass the matching --tokenizer")
 
     def _render_prompt(self, state: Any, suffix: str) -> str:
-        return mmedia.render_prompt(self.tokenizer, self.template_kwargs, build_messages(state, suffix, self.style),
+        return mmedia.render_prompt(self.tokenizer, self.template_kwargs, self._messages(state, suffix),
                                     self._media)
 
     def _png(self, image) -> str:

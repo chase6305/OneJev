@@ -12,6 +12,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import __version__
 from .engine import DecisionEngine
+from .reporting import json_safe
 from .schema import ModelMetadata, ModelMetadataList, SystemOneRequest
 
 log = logging.getLogger("qev.server")
@@ -35,7 +37,17 @@ def _validation_error(exc: ValidationError) -> JSONResponse:
 
 
 def create_app(engine: DecisionEngine, model_name: str, description: str = "", release_date: str = "") -> FastAPI:
-    app = FastAPI(title="Qev", version=__version__)
+    workers: set[asyncio.Task] = set()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            if workers:
+                await asyncio.gather(*workers, return_exceptions=True)
+
+    app = FastAPI(title="Qev", version=__version__, lifespan=lifespan)
     app.state.engine = engine
     app.state.model_name = model_name
     app.state.debias = int(os.environ.get("QEV_DEBIAS", "1"))
@@ -43,6 +55,13 @@ def create_app(engine: DecisionEngine, model_name: str, description: str = "", r
         raise ValueError("QEV_DEBIAS must be a positive integer")
     inference_lock = asyncio.Lock()
     playground = Path(__file__).parent / "playground" / "index.html"
+
+    def inference_finished(task):
+        inference_lock.release()
+        workers.discard(task)
+        # A disconnected caller may no longer be awaiting the worker's error.
+        if not task.cancelled():
+            task.exception()
 
     @app.middleware("http")
     async def request_id(request: Request, call_next):
@@ -82,13 +101,18 @@ def create_app(engine: DecisionEngine, model_name: str, description: str = "", r
         try:
             # Engines keep mutable caches and request-specific diagnostics. Queue on the
             # event loop, then run one inference at a time without blocking other routes.
-            async with inference_lock:
-                response, meta = await run_in_threadpool(engine.decide, req, debias=debias, debug=debug)
+            await inference_lock.acquire()
+            worker = asyncio.create_task(run_in_threadpool(engine.decide, req, debias=debias, debug=debug))
+            workers.add(worker)
+            worker.add_done_callback(inference_finished)
+            # Task cancellation cannot stop a running thread. Keep the engine
+            # reserved until that thread finishes, even if its caller goes away.
+            response, meta = await asyncio.shield(worker)
         except ValueError as exc:
             return JSONResponse(status_code=422, content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]})
         response.model = model_name
         payload = response.model_dump()
-        payload["qev"] = meta
+        payload["qev"] = json_safe(meta)
         return JSONResponse(content=payload)
 
     @app.get("/", response_class=HTMLResponse)

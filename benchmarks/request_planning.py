@@ -39,6 +39,11 @@ def planning_engine(base, tokenizer):
             self.encode_calls += 1
             return self.tokenizer.encode(text, add_special_tokens=False)
 
+        def _encode_many(self, texts):
+            if len(texts) > 1:
+                self.encode_calls += 1
+            return super()._encode_many(texts)
+
         def _run_sequential(self, state, rendered):
             _, suffixes = self._prefix_and_suffix_ids(state, rendered)
             return [BranchResult(r.qid, r.kind, r.labels, r.descriptions, [0.0] * r.n_slots, 1.0, len(s))
@@ -70,6 +75,8 @@ def main(argv=None):
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--questions", type=int, nargs="+", default=[1, 10, 50])
     parser.add_argument("--state-chars", type=int, nargs="+", default=[4000, 40000])
+    parser.add_argument("--structured-state", action="store_true",
+                        help="include nested event records to measure structured-state serialization")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     if not args.tokenizer.is_dir():
@@ -92,10 +99,15 @@ def main(argv=None):
         results = []
         for chars in args.state_chars:
             state = ("The ticket is about a duplicate payment. " * (chars // 40 + 1))[:chars]
+            if args.structured_state:
+                state = {"ticket": {"message": state, "events": [
+                    {"id": i, "kind": "charge", "status": "pending"} for i in range(max(1, chars // 96))]}}
             for count in args.questions:
                 request = SystemOneRequest(state=state, questions={f"q{i}": {"type": "noul", "instructions": f"Is question {i} true?"}
                                                                   for i in range(count)})
                 result = {"state_chars": chars, "questions": count}
+                if args.structured_state:
+                    result.update(structured_state=True, serialized_state_chars=len(json.dumps(state, ensure_ascii=False, indent=2)))
                 responses = []
                 for label, engine in engines.items():
                     result[label], response = measure(engine, request, args.repeats)

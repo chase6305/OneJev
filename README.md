@@ -140,6 +140,9 @@ For `qev serve`, encoded images and video frames have a default limit of 32 MiB 
 `--max-image-bytes BYTES`. Video `fps` must be a finite positive number. The PyTorch backend accepts local media
 paths when `--media-root` is set, with paths confined to that directory. Inference requests queue on the shared
 engine while `/health` and `/v1/models` remain available.
+Non-finite values in `qev` debug diagnostics are retained as `"NaN"`, `"Infinity"` or `"-Infinity"` strings.
+With CUDA graphs enabled, unsupported shapes or insufficient capture memory fall back to eager inference.
+Capture admission runs before vision encoding and decoder warmup; the memory reserve is checked again after warmup.
 
 ### Interactive Studio
 
@@ -256,9 +259,15 @@ Measure request planning with a local tokenizer, optionally comparing a Git revi
 
 ```bash
 python -m benchmarks.request_planning --tokenizer /path/to/local/OneJev --baseline-ref HEAD~1
+# Include nested structured evidence:
+python -m benchmarks.request_planning --tokenizer /path/to/local/OneJev --structured-state
 ```
 
 This benchmark measures rendering, tokenization and answer assembly; it does not load weights or run inference.
+Multi-question requests tokenize their full prompts together while preserving the shared-prefix boundary.
+Structured state is serialized once per request and shared across its branch prompts. Branch token batches are
+assembled before transfer to the device; the eager fork token budget counts the prefix plus the longest suffix per row.
+Set the same `RAYON_NUM_THREADS` value for comparisons so tokenizer thread counts are consistent.
 
 ## Friendly Links
 

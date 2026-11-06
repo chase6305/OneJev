@@ -131,6 +131,9 @@ EOF
 使用 `qev serve` 时，每张编码图片或视频帧默认上限为 32 MiB，可通过 `--max-image-bytes 字节数` 调整。
 视频 `fps` 必须是有限正数。PyTorch 后端设置 `--media-root` 后可读取该目录内的本地媒体文件。
 推理请求在共享引擎上排队，期间 `/health` 和 `/v1/models` 仍可响应。
+`qev` 调试诊断中的非有限值会以 `"NaN"`、`"Infinity"` 或 `"-Infinity"` 字符串保留。
+启用 CUDA Graph 后，尺寸不支持或捕获显存不足的请求会使用常规推理。
+捕获条件在视觉编码和解码器预热前检查，预热后还会再次确认显存余量。
 
 ### 统一交互网站
 
@@ -229,9 +232,15 @@ QEV_TEST_BROWSER=1 python -m pytest -q tests/test_playground.py
 
 ```bash
 python -m benchmarks.request_planning --tokenizer /path/to/local/OneJev --baseline-ref HEAD~1
+# 同时测量嵌套结构化证据的序列化开销：
+python -m benchmarks.request_planning --tokenizer /path/to/local/OneJev --structured-state
 ```
 
 该基准测量提示词渲染、分词和答案组装，不加载模型权重或执行推理。
+多问题请求会合并分词，仍按完整提示词校验共享前缀边界。结构化 state 在单次请求内只序列化一次，
+由各分支提示词复用；分支 token 先组成完整批次再传入设备。常规分支推理的 token 预算按每行的前缀加最长问题后缀计算。
+比较性能时请保持
+`RAYON_NUM_THREADS` 一致，避免分词线程数影响结果。
 
 ## Friendly Links
 

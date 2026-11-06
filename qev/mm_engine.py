@@ -25,8 +25,8 @@ from typing import Any
 
 from . import media as mmedia
 from .calibrate import Calibration, softmax
-from .engine import BranchResult, DecisionEngine, EngineInfo
-from .prompt import DEFAULT_STYLE, PromptStyle, RenderedQuestion, build_messages, render_question
+from .engine import BranchResult, DecisionEngine, EngineInfo, _padded_suffixes
+from .prompt import DEFAULT_STYLE, PromptStyle, RenderedQuestion, render_question
 from .schema import SystemOneRequest, SystemOneResponse
 
 log = logging.getLogger("qev.mm_engine")
@@ -134,13 +134,20 @@ class DecoderGraphs:
 
     def __call__(self, embeds, positions):
         """embeds (1, L, hidden), positions (3, 1, L) -> final-norm hidden state at position L - 1, or None when L is
-        over the largest graph."""
+        over the largest graph. `embeds` may also be a no-argument provider, resolved after admission."""
         import torch
 
-        n = embeds.shape[1]
+        # A lazy embedding provider lets the caller avoid running the vision
+        # tower when this shape or its next capture cannot be admitted.
+        lazy = callable(embeds)
+        n = positions.shape[-1] if lazy else embeds.shape[1]
         size = self._size(n)
         if size is None:
             return None
+        if size not in self.graphs:
+            _make_room(self._evict)
+        if lazy:
+            embeds = embeds()
         if size in self.graphs:
             self.graphs.move_to_end(size)
         emb, pos, out, graph = self.graphs.get(size) or self._capture(size, embeds, positions)
@@ -163,6 +170,9 @@ class DecoderGraphs:
     def _capture(self, size: int, embeds, positions):
         import torch
 
+        # Reject an unavailable capture before allocating its inputs or running
+        # two decoder warmups. Recheck after warmup before capturing as well.
+        _make_room(self._evict)
         emb = torch.zeros((1, size, embeds.shape[-1]), dtype=embeds.dtype, device=embeds.device)
         pos = torch.arange(size, device=embeds.device, dtype=positions.dtype).view(1, 1, -1).repeat(3, 1, 1)
 
@@ -217,14 +227,23 @@ class ForkGraphs:
 
     def __call__(self, embeds, positions, suffixes: list[list[int]], delta: int):
         """embeds (1, P, hidden) and positions (3, 1, P) of the prefix; token ids of each branch. Returns the
-        final-norm hidden state at each branch's last token (rows x hidden), or None when a size is over the limits."""
+        final-norm hidden state at each branch's last token (rows x hidden), or None when a size is over the limits.
+        `embeds` may be a no-argument provider, resolved after admission."""
         import torch
 
-        n, P = len(suffixes), embeds.shape[1]
+        lazy = callable(embeds)
+        n, P = len(suffixes), positions.shape[-1] if lazy else embeds.shape[1]
         width = max(len(s) for s in suffixes)
         size, rows, wide = _bucket(P, self.step), n, _bucket(width, self.width_step)
         if size > self.max_len or rows > self.max_rows or wide > self.max_width:
             return None
+        key = (size, rows, wide)
+        if size not in self.prefills:
+            _make_room(self._evict)
+        elif key not in self.branches:
+            _make_room(lambda: self._evict(keep=size))
+        if lazy:
+            embeds = embeds()
         if size in self.prefills:
             self.prefills.move_to_end(size)
         emb, pos, pad, cache, graph = self.prefills.get(size) or self._capture_prefill(size, embeds, positions)
@@ -235,14 +254,10 @@ class ForkGraphs:
         pos[..., a:].copy_(positions)
         pad.fill_(a)
         graph.replay()
-        key = (size, rows, wide)
         if key in self.branches:
             self.branches.move_to_end(key)
         ids, base, pad_b, out, bgraph = self.branches.get(key) or self._capture_branch(key, cache, positions.dtype)
-        host = torch.full((rows, wide), self.pad_id, dtype=torch.long)
-        for r in range(rows):
-            s = suffixes[r % n]
-            host[r, :len(s)] = torch.tensor(s, dtype=torch.long)
+        host = _padded_suffixes(suffixes, self.pad_id, width=wide)
         ids.copy_(host, non_blocking=True)
         base.fill_(P + delta)
         pad_b.fill_(a)
@@ -286,6 +301,7 @@ class ForkGraphs:
     def _capture_prefill(self, size: int, embeds, positions):
         import torch
 
+        _make_room(self._evict)
         dev = embeds.device
         emb = torch.zeros((1, size, embeds.shape[-1]), dtype=embeds.dtype, device=dev)
         pos = torch.zeros((3, 1, size), dtype=positions.dtype, device=dev)
@@ -314,6 +330,7 @@ class ForkGraphs:
         import torch
 
         size, rows, wide = key
+        _make_room(lambda: self._evict(keep=size))
         dev = self.prefills[size][0].device
         ids = torch.full((rows, wide), self.pad_id, dtype=torch.long, device=dev)
         base = torch.zeros((), dtype=pos_dtype, device=dev)
@@ -519,7 +536,7 @@ class MMDecisionEngine(DecisionEngine):
             proc.rescale_and_normalize = on_gpu
 
     def _render_prompt(self, state: Any, suffix: str) -> str:
-        return mmedia.render_prompt(self.processor, self.template_kwargs, build_messages(state, suffix, self.style),
+        return mmedia.render_prompt(self.processor, self.template_kwargs, self._messages(state, suffix),
                                     self._media)
 
     def _prepare(self, state: Any, rendered: list[RenderedQuestion]) -> Prepared:
@@ -533,7 +550,7 @@ class MMDecisionEngine(DecisionEngine):
         if self._prep is not None and self._prep.key == key:
             return self._prep
         prompts = [self._render_prompt(state, r.suffix) for r in rendered]
-        full = [self._encode(p) for p in prompts]
+        full = self._encode_many(prompts)
         prefix_text = self._render_prompt(state, MARK)
         prefix_u = self._encode(prefix_text[:prefix_text.rindex(MARK)])
         n = len(prefix_u)
@@ -596,7 +613,7 @@ class MMDecisionEngine(DecisionEngine):
             t = inputs["mm_token_type_ids"]
             inputs["mm_token_type_ids"] = torch.cat([t, torch.zeros((1, len(suf)), dtype=t.dtype, device=dev)], 1)
         pos = torch.cat([prep.positions, self._suffix_positions(P, len(suf), 1, prep.delta).to(prep.positions.dtype)], -1)
-        last = self._graph_call("_graphs", lambda g: g(self._embed(inputs), pos))
+        last = self._graph_call("_graphs", lambda g: g(lambda: self._embed(inputs), pos))
         if last is None:
             last = self.model.model(**inputs, position_ids=pos, use_cache=False, return_dict=True).last_hidden_state[:, -1]
         (logits, mass), = self._readout_rows(last, [r.n_slots])
@@ -636,13 +653,14 @@ class MMDecisionEngine(DecisionEngine):
 
         prep = self._prepare(state, rendered)
         P = len(prep.prefix_ids)
-        chunk = max(1, min(len(rendered), self.fork_token_budget // max(P, 1)))
+        width = max(map(len, prep.suffixes))
+        chunk = max(1, min(len(rendered), self.fork_token_budget // max(P + width, 1)))
         results: list[BranchResult | None] = [None] * len(rendered)
         with torch.inference_mode():
             if len(rendered) == 1:
                 return self._run_single(prep, rendered)
             last = self._graph_call("_fork_graphs",
-                                    lambda g: g(self._embed(prep.inputs), prep.positions, prep.suffixes, prep.delta))
+                                    lambda g: g(lambda: self._embed(prep.inputs), prep.positions, prep.suffixes, prep.delta))
             if last is not None:
                 outs = self._readout_rows(last, [r.n_slots for r in rendered])
                 return [BranchResult(r.qid, r.kind, r.labels, r.descriptions, lg, m, len(s))
@@ -671,19 +689,15 @@ class MMDecisionEngine(DecisionEngine):
         dev = self.device
         sufs = [suffixes[i] for i in idx]
         width = max(len(s) for s in sufs)
-        ids = torch.full((len(idx), width), self.pad_id, dtype=torch.long, device=dev)
-        mask = torch.zeros((len(idx), P + width), dtype=torch.long, device=dev)
-        ends = []
-        for row, s in enumerate(sufs):
-            ids[row, : len(s)] = torch.tensor(s, device=dev)
-            mask[row, : P + len(s)] = 1
-            ends.append(len(s) - 1)
+        ids = _padded_suffixes(sufs, self.pad_id, device=dev)
+        lengths = torch.tensor([len(s) for s in sufs], device=dev)
+        mask = (torch.arange(P + width, device=dev)[None] < P + lengths[:, None]).long()
         cache = self._fork(base, len(idx))
         try:
             o = self.model.model(input_ids=ids, attention_mask=mask,
                                  position_ids=self._suffix_positions(P, width, len(idx), delta),
                                  past_key_values=cache, use_cache=True, return_dict=True)
-            last = o.last_hidden_state[torch.arange(len(idx), device=dev), torch.tensor(ends, device=dev)]
+            last = o.last_hidden_state[torch.arange(len(idx), device=dev), lengths - 1]
             outs = self._readout_rows(last, [rendered[i].n_slots for i in idx])
             for row, i in enumerate(idx):
                 r = rendered[i]
